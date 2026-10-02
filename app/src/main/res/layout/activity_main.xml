@@ -117,7 +117,33 @@
             android:orientation="vertical" />
     </ScrollView>
 
-    <!-- player -->
+    <!-- native video player (plays HEVC via the platform decoder, unlike WebView) -->
+    <VideoView
+        android:id="@+id/video"
+        android:layout_width="match_parent"
+        android:layout_height="220dp"
+        android:layout_marginTop="4dp" />
+    <!-- cam switch row -->
+    <LinearLayout
+        android:id="@+id/camRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:visibility="gone">
+        <Button
+            android:id="@+id/btnCamF"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="前摄长焦" />
+        <Button
+            android:id="@+id/btnCamE"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="广角" />
+    </LinearLayout>
+    <!-- signal overlay / charts -->
     <WebView
         android:id="@+id/web"
         android:layout_width="match_parent"

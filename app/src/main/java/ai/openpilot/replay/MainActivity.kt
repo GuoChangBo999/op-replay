@@ -40,6 +40,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnPlay: Button
     private lateinit var btnExt: Button
     private lateinit var web: WebView
+    private lateinit var video: android.widget.VideoView
+    private lateinit var camRow: android.widget.LinearLayout
+    private lateinit var btnCamF: Button
+    private lateinit var btnCamE: Button
     private lateinit var etHost: EditText
     private lateinit var etKey: EditText
     private lateinit var btnConnect: Button
@@ -54,6 +58,14 @@ class MainActivity : AppCompatActivity() {
 
     private var baseHost: String? = null          // e.g. http://10.90.179.99:5088
     private var currentDir = "/data/media/0/realdata"  // for SSH fallback (unused now)
+    private var lastTranscodeError: String? = null
+
+    // ---- 方案A：原生 VideoView 播放 + WebView 图表
+    private var frontPath: String? = null   // 已复制到 cache 的前摄文件绝对路径
+    private var widePath: String? = null    // 已复制到 cache 的广角文件绝对路径
+    private var curCam = "front"            // front | wide
+    private var syncRunning = false
+    private val syncHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
     // ---- local-file pickers
     // NOTE: we pick with "*/*" on purpose. HEVC raw streams (fcamera.hevc / ecamera.hevc)
@@ -170,6 +182,10 @@ class MainActivity : AppCompatActivity() {
         btnPlay = findViewById(R.id.btnPlay)
         btnExt = findViewById(R.id.btnExt)
         web = findViewById(R.id.web)
+        video = findViewById(R.id.video)
+        camRow = findViewById(R.id.camRow)
+        btnCamF = findViewById(R.id.btnCamF)
+        btnCamE = findViewById(R.id.btnCamE)
         etHost = findViewById(R.id.etHost)
         etKey = findViewById(R.id.etKey)
         btnConnect = findViewById(R.id.btnConnect)
@@ -180,6 +196,29 @@ class MainActivity : AppCompatActivity() {
         web.settings.javaScriptEnabled = true
         web.settings.allowFileAccess = true
         web.settings.domStorageEnabled = true
+        // 模板点图表时回调原生 -> VideoView seek
+        web.addJavascriptInterface(object {
+            @android.webkit.JavascriptInterface
+            fun onSeek(sec: String) {
+                val t = sec.toDoubleOrNull() ?: return
+                runOnUiThread {
+                    try {
+                        video.seekTo((t * 1000).toInt())
+                        if (!video.isPlaying) video.start()
+                    } catch (_: Exception) {}
+                }
+            }
+        }, "OPJS")
+        // VideoView 播放时，定时把当前时间推给图表
+        video.setOnPreparedListener { mp ->
+            mp.isLooping = false
+            video.seekTo(0)
+            video.start()
+            startSync()
+        }
+        video.setOnCompletionListener { stopSync() }
+        btnCamF.setOnClickListener { switchCam("front") }
+        btnCamE.setOnClickListener { switchCam("wide") }
 
         if (!Python.isStarted()) Python.start(AndroidPlatform(this))
 
@@ -407,34 +446,88 @@ class MainActivity : AppCompatActivity() {
         status.text = "处理中:复制视频…"
         Thread {
             try {
-                val vfRaw = copyToCache(vUri, "video_raw.hevc")
-                val efRaw = wideUri?.let { copyToCache(it, "video_wide_raw.hevc") }
-                // HEVC raw streams are not playable in the WebView; do a hardware transcode
-                // (HEVC decode -> H.264 encode) so the video plays while the signal charts,
-                // blinkers and steering wheel stay visible underneath.
-                runOnUiThread { status.text = "处理中:转码视频(HEVC→H.264)…" }
-                val vf = ensurePlayable(vfRaw) { p ->
-                    runOnUiThread { status.text = "转码前摄… $p%" }
-                }
-                val ef = efRaw?.let {
-                    ensurePlayable(it) { p -> runOnUiThread { status.text = "转码广角… $p%" } }
-                }
+                // 方案A：VideoView 用系统 HEVC 硬解直接播原始裸流，无需转码。
+                // 扩展名必须带 .hevc 之类，VideoView 才能识别为视频；我们复制成 *.hevc。
+                val vfRaw = copyToCache(vUri, "front.hevc")
+                val efRaw = wideUri?.let { copyToCache(it, "wide.hevc") }
+                frontPath = vfRaw.absolutePath
+                widePath = efRaw?.absolutePath
+
                 runOnUiThread { status.text = "处理中:解析日志…" }
                 val lf = copyToCache(lUri, "qlog.zst")
                 val mod = Python.getInstance().getModule("op_parser")
                 val json = mod.callAttr("parse_route", lf.absolutePath, "").toString()
                 runOnUiThread { status.text = "处理中:生成播放页…" }
-                val html = buildHtml(json, vf, ef)
+                val html = buildHtml(json, vfRaw, efRaw)
                 runOnUiThread {
-                    web.loadDataWithBaseURL("file://${vf.parentFile!!.absolutePath}/", html, "text/html", "utf-8", null)
+                    // WebView 只显示图表；视频由上面的 VideoView 播
+                    web.loadDataWithBaseURL("file://${vfRaw.parentFile!!.absolutePath}/", html, "text/html", "utf-8", null)
                     val m = Regex("\"samples\":\\s*(\\d+)").find(json)
                     status.text = "就绪(${m?.groupValues?.get(1) ?: "?"} 采样点)"
+
+                    // 摄像头切换按钮：有广角才显示
+                    camRow.visibility = if (efRaw != null) View.VISIBLE else View.GONE
+                    curCam = "front"
+                    // 启动原生播放
+                    playCam("front")
                     btnPlay.isEnabled = true
                 }
             } catch (e: Exception) {
                 runOnUiThread { status.text = "失败:${e.message}"; btnPlay.isEnabled = true }
             }
         }.start()
+    }
+
+    /** 原生 VideoView 播放指定摄像头文件 */
+    private fun playCam(cam: String) {
+        val path = if (cam == "wide") widePath else frontPath
+        if (path == null) return
+        curCam = cam
+        try {
+            video.setVideoPath(path)
+            video.requestFocus()
+        } catch (e: Exception) {
+            status.text = "播放失败:${e.message}"
+        }
+        web.evaluateJavascript("window.opReplay && window.opReplay.setCam('${if (cam=="wide") "广角" else "前摄长焦"}')", null)
+        btnCamF?.let { it.alpha = if (cam == "front") 1f else 0.5f }
+        btnCamE?.let { it.alpha = if (cam == "wide") 1f else 0.5f }
+    }
+
+    /** 切换前摄/广角，保持当前时间 */
+    private fun switchCam(cam: String) {
+        if (cam == curCam) return
+        val t = try { video.currentPosition } catch (_: Exception) { 0 }
+        playCam(cam)
+        // 切换后恢复到同一时间点
+        video.setOnPreparedListener { mp ->
+            mp.isLooping = false
+            try { video.seekTo(t) } catch (_: Exception) {}
+            video.start()
+            startSync()
+        }
+    }
+
+    /** 每 ~100ms 把 VideoView 当前时间推给 WebView 图表 */
+    private fun startSync() {
+        if (syncRunning) return
+        syncRunning = true
+        val tick = object : Runnable {
+            override fun run() {
+                if (!syncRunning) return
+                try {
+                    val t = video.currentPosition / 1000.0
+                    web.evaluateJavascript("window.opReplay && window.opReplay.setTime($t)", null)
+                } catch (_: Exception) {}
+                syncHandler.postDelayed(this, 100)
+            }
+        }
+        syncHandler.postDelayed(tick, 100)
+    }
+
+    private fun stopSync() {
+        syncRunning = false
+        syncHandler.removeCallbacksAndMessages(null)
     }
 
     private fun copyToCache(uri: Uri, name: String): File {
@@ -470,10 +563,18 @@ class MainActivity : AppCompatActivity() {
         if (out.exists()) out.delete()
         try {
             return transcodeHevcToAvc(src, out, onProgress)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            lastTranscodeError = "${e.javaClass.simpleName}: ${e.message}"
             return src
         }
     }
+
+    private fun headHex(f: File): String = try {
+        FileInputStream(f).use { ins ->
+            val b = ByteArray(16); val n = ins.read(b)
+            b.copyOf(n).joinToString(" ") { "%02x".format(it) }
+        }
+    } catch (e: Exception) { "ERR:${e.message}" }
 
     /**
      * Hardware transcode: MediaCodec(HEVC decoder) -> MediaCodec(AVC/H.264 encoder) -> MediaMuxer.
@@ -587,11 +688,9 @@ class MainActivity : AppCompatActivity() {
     private fun buildHtml(signalsJson: String, videoFile: File, wideFile: File? = null): String {
         val chartJs = assets.open("chart.umd.min.js").bufferedReader().readText()
         val tpl = assets.open("replay_template.html").bufferedReader().readText()
-        val wideName = wideFile?.name ?: "__CAM_E__"   // leave the placeholder -> JS hides the switch
+        // 方案A：模板里已无视频引用，只需要注入图表库与信号数据。
         return tpl.replace("__CHARTJS__", chartJs)
             .replace("__SERIES_JSON__", signalsJson)
-            .replace("__CAM_E__", wideName)
-            .replace("__VIDEO_FILE__", videoFile.name)
     }
 
     private fun displayName(uri: Uri): String {
@@ -713,6 +812,8 @@ private class EglRenderer(
     private var extTexId = 0
 
     private val texMatrix = FloatArray(16)
+    private val frameLock = Object()
+    @Volatile private var frameAvailable = false
 
     init {
         display = android.opengl.EGL14.eglGetDisplay(android.opengl.EGL14.EGL_DEFAULT_DISPLAY)
@@ -752,6 +853,9 @@ private class EglRenderer(
         android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_S, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
         android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_T, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
         surfaceTexture.attachToGLContext(extTexId)
+        surfaceTexture.setOnFrameAvailableListener {
+            synchronized(frameLock) { frameAvailable = true; frameLock.notifyAll() }
+        }
 
         program = buildProgram()
         uTexMatrix = android.opengl.GLES20.glGetUniformLocation(program, "uTexMatrix")
@@ -769,8 +873,16 @@ private class EglRenderer(
             throw RuntimeException("eglMakeCurrent failed")
     }
 
-    /** pull the latest decoded frame into the external texture and update its transform. */
+    /** wait for a decoded frame to arrive, then pull it into the external texture. */
     fun awaitNewImage() {
+        synchronized(frameLock) {
+            var waited = 0L
+            while (!frameAvailable && waited < 2000) {
+                try { frameLock.wait(50) } catch (_: InterruptedException) {}
+                waited += 50
+            }
+            frameAvailable = false
+        }
         surfaceTexture.updateTexImage()
         surfaceTexture.getTransformMatrix(texMatrix)
     }
