@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>openpilot replay</title>
+<style>
+ *{box-sizing:border-box}
+ body{background:#000;color:#eee;margin:0;font-family:-apple-system,Roboto,'PingFang SC',sans-serif}
+ header{padding:10px 14px;font-size:14px;color:#8e8e93;border-bottom:1px solid #1c1c1e}
+ .wrap{padding:12px;display:flex;flex-direction:column;gap:10px}
+ video{width:100%;max-height:42vh;background:#111;border-radius:12px;display:block;flex:none}
+ .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:6px}
+ .card{background:#1c1c1e;border-radius:12px;padding:10px;text-align:center}
+ .card .k{font-size:11px;color:#8e8e93}
+ .card .v{font-size:22px;font-weight:600;margin-top:2px}
+ .gas .v{color:#00e676}.brake .v{color:#ff5252}
+ .steer .v{color:#ffd60a}.speed .v{color:#3b9eff}
+ .blinkbar{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+ .bigblink{background:#141414;border:2px solid #2a2a2a;border-radius:14px;padding:14px 8px;text-align:center}
+ .bigblink .arrow{font-size:46px;line-height:1;color:#333}
+ .bigblink .lbl{font-size:13px;color:#666;margin-top:6px;letter-spacing:2px}
+ /* real-car style blinking (0.6s on/off) */
+ @keyframes blinkleft{
+   0%,49%{background:#2a1d00;border-color:#ff9f0a;box-shadow:0 0 26px rgba(255,159,10,.65)}
+   50%,100%{background:#141414;border-color:#2a2a2a;box-shadow:none}
+ }
+ @keyframes blinkright{
+   0%,49%{background:#2a1d00;border-color:#ff9f0a;box-shadow:0 0 26px rgba(255,159,10,.65)}
+   50%,100%{background:#141414;border-color:#2a2a2a;box-shadow:none}
+ }
+ @keyframes arrup{0%,49%{color:#ff9f0a;text-shadow:0 0 18px #ff9f0a}50%,100%{color:#333;text-shadow:none}}
+ .bigblink.left.on{animation:blinkleft .8s steps(1,end) infinite}
+ .bigblink.left.on .arrow{animation:arrup .8s steps(1,end) infinite}
+ .bigblink.left.on .lbl{color:#ff9f0a}
+ .bigblink.right.on{animation:blinkright .8s steps(1,end) infinite}
+ .bigblink.right.on .arrow{animation:arrup .8s steps(1,end) infinite}
+ .bigblink.right.on .lbl{color:#ff9f0a}
+ canvas{background:#111;border-radius:12px;width:100%}
+ .wheelbox{display:flex;align-items:center;justify-content:center;gap:18px;padding:6px 0}
+ #wheelg{transform-origin:100px 100px;transition:transform .08s linear}
+ .wheelang{font-size:28px;font-weight:700;color:#ffd60a;min-width:110px;text-align:center}
+ .hint{color:#666;font-size:12px;text-align:center;padding:4px}
+ .cam{flex:1;padding:8px;border-radius:8px;border:1px solid #333;background:#1c1c1e;color:#ccc;font-size:13px}
+ .cam.active{background:#3b9eff;color:#fff;border-color:#3b9eff}
+ .cambar{display:flex;gap:10px;padding:2px 0}
+ button.cam{cursor:pointer;padding:14px 10px;font-size:16px;font-weight:700;border-radius:10px;border:2px solid #3b9eff;background:#0a2a4d;color:#7ec1ff;flex:1}
+ button.cam.active{background:#3b9eff;color:#fff;border-color:#7ec1ff;box-shadow:0 0 14px rgba(59,158,255,.7)}
+</style></head><body>
+<div id="jserr" style="position:fixed;top:0;left:0;right:0;z-index:9999;background:#900;color:#fff;font-size:12px;padding:6px;white-space:pre-wrap;display:none"></div>
+<script>
+window.onerror=function(m,s,l,c,e){var d=document.getElementById('jserr');d.style.display='block';d.textContent='JS ERROR: '+m+' @line '+l+(e&&e.stack?('\n'+e.stack):'');};
+</script>
+<header id="hdr">openpilot Route Replay</header>
+<div class="wrap">
+  <video id="vid" controls playsinline webkit-playsinline x5-playsinline x5-video-player-type="h5" x5-video-player-fullscreen="false" preload="metadata" src="__VIDEO_FILE__"></video>
+  <div id="vidErr" style="display:none;color:#ff6b6b;font-size:13px;padding:6px;background:#2a1414;border-radius:8px;margin-top:4px">
+    ⚠️ 视频无法在本页播放（WebView 可能不支持该编码）。请返回点「外部播放」用系统播放器打开。
+  </div>
+  <div class="cambar" id="cambar">
+    <button class="cam active" id="btnF">前摄长焦</button>
+    <button class="cam" id="btnE">广角</button>
+  </div>
+  <div class="blinkbar">
+    <div class="bigblink left" id="c_bl">
+      <div class="arrow">◀</div><div class="lbl">左 转 向</div>
+    </div>
+    <div class="bigblink right" id="c_br">
+      <div class="arrow">▶</div><div class="lbl">右 转 向</div>
+    </div>
+  </div>
+  <div class="stats">
+    <div class="card speed"><div class="k">车速 km/h</div><div class="v" id="s_v">--</div></div>
+    <div class="card gas"><div class="k">油门 %</div><div class="v" id="s_g">--</div></div>
+    <div class="card brake"><div class="k">刹车 %</div><div class="v" id="s_b">--</div></div>
+    <div class="card steer"><div class="k">方向 °</div><div class="v" id="s_s">--</div></div>
+  </div>
+  <div class="wheelbox">
+    <svg id="wheel" viewBox="0 0 200 200" width="150" height="150">
+      <g id="wheelg">
+        <!-- outer rim (thick ring, line-art style) -->
+        <circle cx="100" cy="100" r="72" fill="none" stroke="#8e8e93" stroke-width="13"/>
+        <!-- hub -->
+        <circle cx="100" cy="100" r="26" fill="#1c1c1e" stroke="#8e8e93" stroke-width="9"/>
+        <!-- spokes: left, right, bottom (standard steering wheel) -->
+        <rect x="34" y="94" width="46" height="12" rx="6" fill="#8e8e93"/>
+        <rect x="120" y="94" width="46" height="12" rx="6" fill="#8e8e93"/>
+        <rect x="94" y="120" width="12" height="46" rx="6" fill="#8e8e93"/>
+        <!-- center marker (shows orientation) -->
+        <circle cx="100" cy="100" r="7" fill="#3b9eff"/>
+        <!-- top index dot on the rim -->
+        <circle cx="100" cy="28" r="8" fill="#ffd60a"/>
+      </g>
+    </svg>
+    <div class="wheelang" id="s_w">0°</div>
+  </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;font-size:12px;color:#8e8e93">
+    <span>时间对齐</span>
+    <input id="offset" type="range" min="-10" max="10" step="0.1" value="0" style="flex:1">
+    <span id="offv" style="width:48px;text-align:right;color:#3b9eff">0.0s</span>
+  </div>
+  <canvas id="chart" height="220"></canvas>
+  <div class="hint">点图表可跳转视频</div>
+</div>
+<script>__CHARTJS__</script>
+<script>
+const RAW = __SERIES_JSON__;
+const DATA = RAW.signals, META = RAW.meta;
+document.getElementById('hdr').textContent =
+  'openpilot Route Replay · ' + (META.duration||0).toFixed(1) + 's · ' + (META.samples||0) + ' samples';
+
+const chart = new Chart(document.getElementById('chart'), {
+  type:'line',
+  data:{ labels: DATA.t,
+    datasets:[
+     {label:'车速 km/h', data:DATA.vEgo.map(v=>v==null?null:v*3.6), borderColor:'#3b9eff', borderWidth:1.5, pointRadius:0, tension:.25},
+     {label:'油门', data:DATA.gas, borderColor:'#00e676', borderWidth:1.2, pointRadius:0, tension:.25},
+     {label:'刹车', data:DATA.brake, borderColor:'#ff5252', borderWidth:1.2, pointRadius:0, tension:.25},
+     {label:'方向°', data:DATA.steer, borderColor:'#ffd60a', borderWidth:1, pointRadius:0, tension:.25, yAxisID:'y1'}]},
+  options:{animation:false, responsive:true, maintainAspectRatio:true,
+    interaction:{mode:'index',intersect:false},
+    plugins:{legend:{labels:{color:'#ccc',boxWidth:12}}},
+    scales:{
+      x:{ticks:{color:'#888',maxTicksLimit:8},grid:{color:'#222'}},
+      y:{ticks:{color:'#888'},grid:{color:'#222'}},
+      y1:{position:'right',ticks:{color:'#ffd60a'},grid:{display:false}}}}
+});
+
+const video = document.getElementById('vid');
+// camera sources (fcamera = front/tele, ecamera = wide). __CAM_E__ is injected when both exist.
+const CAM = { front: "__VIDEO_FILE__", wide: "__CAM_E__" };
+let CAMK = 'front';
+(function initCam(){
+  const btnF=document.getElementById('btnF'), btnE=document.getElementById('btnE');
+  const bar=document.getElementById('cambar');
+  if(!bar||!btnF||!btnE) return;
+  // A valid wide source must look like a real video (data:/http/file or *.mp4/hevc/ts).
+  // (We must NOT compare against a placeholder string here: the build step does a
+  //  blanket .replace() over the whole file, which would rewrite it too.)
+  const w = String(CAM.wide||'');
+  const okWide = /^(data:|https?:|file:)/.test(w) || /\.(mp4|hevc|ts|webm)$/i.test(w);
+  if(!okWide){
+    bar.style.display='none'; return;
+  }
+  function setCam(k){
+    CAMK=k;
+    const t=video.currentTime, playing=!video.paused;
+    video.src = CAM[k];
+    try{ video.currentTime = t; }catch(e){}
+    if(playing) video.play();
+    btnF.classList.toggle('active', k==='front');
+    btnE.classList.toggle('active', k==='wide');
+  }
+  btnF.onclick=()=>setCam('front');
+  btnE.onclick=()=>setCam('wide');
+})();
+const T=DATA.t, VE=DATA.vEgo, G=DATA.gas, B=DATA.brake, S=DATA.steer;
+const BL=DATA.leftBlinker||[], BR=DATA.rightBlinker||[];
+const GP=DATA.gasPressed||[], BP=DATA.brakePressed||[];
+const gmax=Math.max.apply(null,G.concat([0]));
+const bmax=Math.max.apply(null,B.concat([0]));
+let OFF = 0;                 // sync offset (s): signal_time = video_time + OFF
+function nearest(t){let lo=0,hi=T.length-1,i=0;while(lo<=hi){const m=(lo+hi)>>1;if(T[m]<=t){i=m;lo=m+1;}else hi=m-1;}return i;}
+function paint(i){
+  const v=VE[i],g=G[i],b=B[i],s=S[i];
+  document.getElementById('s_v').textContent=v==null?'--':(v*3.6).toFixed(1);
+  const gp=GP[i]||0, bpv=BP[i]||0;
+  // gas pedal opening: use pedal value if present, else fall back to pressed switch
+  let gtxt;
+  if(g!=null && gmax>0.001) gtxt=(g/gmax*100).toFixed(0)+'%';
+  else gtxt = gp>0 ? '踩' : '—';
+  document.getElementById('s_g').textContent=gtxt;
+  // brake: normalize by the route's own max (0-100%)
+  let btxt;
+  if(bmax>0.001) btxt=Math.max(0,Math.min(100,(b/bmax*100))).toFixed(0)+'%';
+  else btxt = bpv>0 ? '踩' : '—';
+  document.getElementById('s_b').textContent=btxt;
+  document.getElementById('s_s').textContent=s==null?'--':s.toFixed(0);
+  // steering: openpilot steeringAngleDeg is positive to the LEFT (CCW).
+  // CSS rotate(+) is clockwise, so negate to match the physical wheel.
+  const ang = s==null?0:Math.max(-540,Math.min(540,-s));
+  document.getElementById('wheelg').style.transform='rotate('+ang+'deg)';
+  document.getElementById('s_w').textContent = s==null?'--':(s>0?'左 ':'')+(s<0?'右 ':'')+Math.abs(s).toFixed(0)+'°';
+  const bl = BL[i]||0, br = BR[i]||0;
+  document.getElementById('c_bl').classList.toggle('on', bl>0);
+  document.getElementById('c_br').classList.toggle('on', br>0);
+  if(window._li!==i){ window._li=i; chart.data.datasets.forEach((d,k)=>{d.pointRadius=T.map((_,j)=>j===i?3:0);}); chart.update('none'); }
+}
+let _pending=false, _lastI=0;
+function paintThrottled(i){ _lastI=i; if(_pending) return; _pending=true; requestAnimationFrame(()=>{_pending=false;paint(_lastI);}); }
+video.addEventListener('timeupdate',()=>paintThrottled(nearest(video.currentTime+OFF)));
+// warn when the WebView can't decode the stream (e.g. HEVC on some devices)
+function showVidErr(){
+  var e=document.getElementById('vidErr'); if(e) e.style.display='block';
+}
+video.addEventListener('error',showVidErr);
+video.addEventListener('stalled',function(){ if(video.error) showVidErr(); });
+setTimeout(function(){ if(video.readyState===0 && video.networkState===3) showVidErr(); },2500);
+document.getElementById('chart').addEventListener('click',ev=>{
+  const pts=chart.getElementsAtEventForMode(ev,'index',{intersect:false},true);
+  if(pts.length){const i=pts[0].index;video.currentTime=Math.max(0,T[i]-OFF);paint(i);}
+});
+// --- sync offset slider ---
+const offEl = document.getElementById('offset'), offV = document.getElementById('offv');
+offEl.addEventListener('input', ()=>{ OFF = parseFloat(offEl.value); offV.textContent = OFF.toFixed(1)+'s'; paint(nearest(video.currentTime+OFF)); });
+paint(0);
+</script></body></html>

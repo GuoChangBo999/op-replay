@@ -1,0 +1,859 @@
+package ai.openpilot.replay
+
+import android.net.Uri
+import android.graphics.SurfaceTexture
+import android.opengl.GLES11Ext
+import android.opengl.GLES20
+import android.os.Bundle
+import android.provider.OpenableColumns
+import android.view.View
+import android.webkit.WebView
+import android.widget.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.regex.Pattern
+
+/**
+ * OP Replay - openpilot dashcam + vehicle signal viewer.
+ *
+ * Three ways to get data:
+ *   1) 本地文件  : pick fcamera.mp4/hevc + qlog.zst manually
+ *   2) 设备直连  : input IP:port (e.g. 10.90.179.99:5088), browse the device's
+ *                  "行车记录查看下载" page, download the 5 route files
+ *                  (ecamera / fcamera / qcamera / qlog / rlog) into a per-route
+ *                  folder, then auto-parse and play.
+ *   3) (fallback) if the page exposes plain links we still parse them.
+ */
+class MainActivity : AppCompatActivity() {
+
+    // ---- views
+    private lateinit var status: TextView
+    private lateinit var btnVideo: Button
+    private lateinit var btnLog: Button
+    private lateinit var btnPlay: Button
+    private lateinit var btnExt: Button
+    private lateinit var web: WebView
+    private lateinit var etHost: EditText
+    private lateinit var etKey: EditText
+    private lateinit var btnConnect: Button
+    private lateinit var remoteList: LinearLayout
+    private lateinit var pageNav: LinearLayout
+    private lateinit var tvPage: TextView
+
+    // ---- state
+    private var videoUri: Uri? = null
+    private var logUri: Uri? = null
+    private var wideUri: Uri? = null        // optional 广角 (ecamera) for the cam switch
+
+    private var baseHost: String? = null          // e.g. http://10.90.179.99:5088
+    private var currentDir = "/data/media/0/realdata"  // for SSH fallback (unused now)
+
+    // ---- local-file pickers
+    // NOTE: we pick with "*/*" on purpose. HEVC raw streams (fcamera.hevc / ecamera.hevc)
+    // have no MIME type registered on many devices, so a "video/*" filter would grey them out.
+    private val pickVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            videoUri = uri
+            val nm = displayName(uri)
+            status.text = "视频已选:$nm"
+            // auto-pair: look for the matching ecamera (wide) next to this file
+            autoPairWide(uri)
+            refreshPlayBtn()
+        }
+    }
+    private val pickLog = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            logUri = uri
+            val nm = displayName(uri)
+            status.text = "日志已选:$nm"
+            // auto-pair BOTH cameras from the same route id (name prefix)
+            autoPairFrom(uri)
+            refreshPlayBtn()
+        }
+    }
+
+    /**
+     * Given a picked file (qlog.zst / fcamera.hevc / any route file), work out its
+     * route id (the leading "yyyy-MM-dd-HH-mm-ss") and try to locate the sibling
+     * fcamera.hevc (front) and ecamera.hevc (wide) in the same folder.
+     *
+     * openpilot route dirs look like:
+     *   /realdata/2026-10-02-20-24-08--0/
+     *       fcamera.hevc  ecamera.hevc  qcamera.ts  qlog.zst  rlog.zst
+     * but the downloaded (flattened) names are often:
+     *   2026-10-02-20-24-08-fcamera.hevc
+     *   2026-10-02-20-24-08-ecamera.hevc
+     *   2026-10-02-20-24-08-qlog.zst
+     * so we handle both shapes.
+     */
+    private fun autoPairFrom(uri: Uri) {
+        val nm = displayName(uri)
+        val route = routeIdOf(nm) ?: return
+        // 1) same SAF folder (works for content:// URIs picked from DocumentsUI)
+        findSibling(uri, route, "fcamera")?.let { if (videoUri == null) videoUri = it }
+        findSibling(uri, route, "ecamera")?.let { wideUri = it }
+        // 2) plain filesystem scan (works for file:// URIs)
+        val p = uri.path
+        if ((videoUri == null || wideUri == null) && p != null && p.startsWith("/")) {
+            val parent = File(p).parentFile
+            if (parent != null && parent.isDirectory) {
+                val files = parent.listFiles() ?: emptyArray()
+                if (videoUri == null)
+                    files.firstOrNull { it.name.contains(route) && it.name.contains("fcamera") }
+                        ?.let { videoUri = Uri.fromFile(it) }
+                if (wideUri == null)
+                    files.firstOrNull { it.name.contains(route) && it.name.contains("ecamera") }
+                        ?.let { wideUri = Uri.fromFile(it) }
+                if (videoUri == null)
+                    files.firstOrNull { it.name.contains("fcamera") }?.let { videoUri = Uri.fromFile(it) }
+                if (wideUri == null)
+                    files.firstOrNull { it.name.contains("ecamera") }?.let { wideUri = Uri.fromFile(it) }
+            }
+        }
+        val v = videoUri?.let { displayName(it) } ?: "—"
+        val w = wideUri?.let { displayName(it) } ?: "—"
+        status.text = "已配对  前摄:$v   广角:$w"
+    }
+
+    private fun autoPairWide(videoOrAny: Uri) {
+        val nm = displayName(videoOrAny)
+        val route = routeIdOf(nm) ?: return
+        findSibling(videoOrAny, route, "ecamera")?.let { wideUri = it }
+        val p = videoOrAny.path
+        if (wideUri == null && p != null && p.startsWith("/")) {
+            File(p).parentFile?.takeIf { it.isDirectory }?.listFiles()
+                ?.firstOrNull { it.name.contains(route) && it.name.contains("ecamera") }
+                ?.let { wideUri = Uri.fromFile(it) }
+        }
+    }
+
+    /** extract "2026-10-02-20-24-08" from any filename/uri containing it. */
+    private fun routeIdOf(name: String): String? {
+        val m = Regex("(\\d{4}-\\d{2}-\\d{2}-\\d{2}-\\d{2}-\\d{2})").find(name)
+        return m?.groupValues?.get(1)
+    }
+
+    /** List the picked document's parent folder (via DocumentsContract) and return the sibling
+     *  whose name contains both [route] and [cam]. Returns null when not resolvable. */
+    private fun findSibling(from: Uri, route: String, cam: String): Uri? {
+        return try {
+            val treeId = android.provider.DocumentsContract.getTreeDocumentId(from)
+            val parentUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(from, treeId)
+            contentResolver.query(parentUri, arrayOf(
+                android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME
+            ), null, null, null)?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getString(0); val name = c.getString(1) ?: continue
+                    if (name.contains(route) && name.contains(cam))
+                        return android.provider.DocumentsContract.buildDocumentUriUsingTree(from, id)
+                }
+            }
+            null
+        } catch (_: Exception) { null }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        status = findViewById(R.id.status)
+        btnVideo = findViewById(R.id.btnVideo)
+        btnLog = findViewById(R.id.btnLog)
+        btnPlay = findViewById(R.id.btnPlay)
+        btnExt = findViewById(R.id.btnExt)
+        web = findViewById(R.id.web)
+        etHost = findViewById(R.id.etHost)
+        etKey = findViewById(R.id.etKey)
+        btnConnect = findViewById(R.id.btnConnect)
+        remoteList = findViewById(R.id.remoteList)
+        pageNav = findViewById(R.id.pageNav)
+        tvPage = findViewById(R.id.tvPage)
+
+        web.settings.javaScriptEnabled = true
+        web.settings.allowFileAccess = true
+        web.settings.domStorageEnabled = true
+
+        if (!Python.isStarted()) Python.start(AndroidPlatform(this))
+
+        // 密钥框在新方案里用不到（设备页面走 HTTP），隐藏掉避免困惑
+        etKey.visibility = View.GONE
+
+        btnVideo.setOnClickListener { pickVideo.launch(arrayOf("*/*")) }
+        btnLog.setOnClickListener { pickLog.launch(arrayOf("*/*")) }
+        btnPlay.setOnClickListener { runReplay() }
+        btnExt.setOnClickListener { openExternally() }
+        btnConnect.setOnClickListener { connect() }
+
+        status.text = "输入设备 IP:端口（如 10.90.179.99:5088）连接，或选本地文件。"
+    }
+
+    // =====================================================================
+    //  connect
+    // =====================================================================
+
+    private fun connect() {
+        val host = etHost.text.toString().trim()
+        if (host.isEmpty()) { toast("请输入 IP:端口"); return }
+        var h = host
+        if (!h.startsWith("http://") && !h.startsWith("https://")) h = "http://$h"
+        baseHost = h
+        loadDevicePage(h)
+    }
+
+    // =====================================================================
+    //  device page (:5088 "行车记录查看下载")
+    // =====================================================================
+
+    private fun loadDevicePage(base: String) {
+        status.text = "连接 $base …"
+        Thread {
+            try {
+                val html = httpGet("$base/")
+                runOnUiThread {
+                    status.text = "已连接设备"
+                    remoteList.removeAllViews()
+                    val pvRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                    val btnOpen = Button(this).apply { text = "在浏览器中打开原页面" }
+                    btnOpen.setOnClickListener {
+                        web.loadDataWithBaseURL("$base/", html, "text/html", "utf-8", null)
+                    }
+                    pvRow.addView(btnOpen)
+                    remoteList.addView(pvRow)
+                    renderRoutes(base, html)
+                }
+            } catch (e: Exception) {
+                runOnUiThread { status.text = "连接失败:${e.message}（确认设备开机且与手机同网）" }
+            }
+        }.start()
+    }
+
+    /**
+     * Parse the device page and build our own list of "route cards".
+     * Each card = one recording段, with 5 download buttons:
+     *   广角HEVC(ecamera) / 前摄HEVC(fcamera) / 标清(qcamera) / qlog / rlog
+     *
+     * The page structure is unknown to us exactly, so we do a *robust* job:
+     *   - find all <a href="...">  and all onclick="...download..." patterns
+     *   - group links by route id (the yyyy-mm-dd-hh-mm-ss prefix in the url/name)
+     *   - for each route, map each link to a camera by keyword
+     */
+    private fun renderRoutes(base: String, html: String) {
+        val routes = DevicePageParser.parse(base, html)
+        if (routes.isEmpty()) {
+            val tv = TextView(this).apply {
+                text = "页面已获取，但未识别到 route 下载链接。\n点上面的按钮可查看原始页面。"
+            }
+            remoteList.addView(tv)
+            return
+        }
+        status.text = "共 ${routes.size} 段"
+        for (r in routes) remoteList.addView(buildRouteCard(r))
+    }
+
+    private fun buildRouteCard(r: RouteEntry): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(16, 16, 16, 16)
+        }
+        val title = TextView(this).apply {
+            text = "${r.route}   ${r.sizeText}".trim()
+            textSize = 15f
+        }
+        card.addView(title)
+
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+
+        fun mk(label: String, url: String?, col: String) {
+            val b = Button(this).apply {
+                text = label
+                isEnabled = url != null
+                setOnClickListener { url?.let { startRouteDownload(r, col, it) } }
+            }
+            card.addView(b)
+        }
+        // two rows for the 5 buttons
+        val btnAll = Button(this).apply {
+            text = "⬇ 下载全部 5 个文件"
+            setOnClickListener { downloadAll(r) }
+        }
+        card.addView(btnAll)
+        mk("广角HEVC", r.ecamera, "ecamera")
+        mk("前摄HEVC", r.fcamera, "fcamera")
+        mk("标清", r.qcamera, "qcamera")
+        mk("qlog", r.qlog, "qlog")
+        mk("rlog", r.rlog, "rlog")
+        card.addView(TextView(this).apply { text = " " })
+        return card
+    }
+
+    // =====================================================================
+    //  downloads
+    // =====================================================================
+
+    private fun downloadAll(r: RouteEntry) {
+        val items = listOfNotNull(
+            r.ecamera?.let { "ecamera" to it },
+            r.fcamera?.let { "fcamera" to it },
+            r.qcamera?.let { "qcamera" to it },
+            r.qlog?.let { "qlog" to it },
+            r.rlog?.let { "rlog" to it },
+        )
+        Thread {
+            val dir = File(getExternalFilesDir(null), "routes/${r.route}")
+            dir.mkdirs()
+            var done = 0
+            for ((col, url) in items) {
+                try {
+                    runOnUiThread { status.text = "下载 ${r.route} / $col ($done/${items.size})" }
+                    val ext = if (col == "qlog" || col == "rlog") ".zst"
+                              else if (col == "qcamera") ".ts" else ".hevc"
+                    val out = File(dir, "$col$ext")
+                    download(url, out)
+                    done++
+                    runOnUiThread { status.text = "已下载 $col (${out.length()/1024/1024} MB)" }
+                } catch (e: Exception) {
+                    runOnUiThread { status.text = "下载 $col 失败:${e.message}" }
+                }
+            }
+            runOnUiThread {
+                status.text = "全部下载完成，自动解析…"
+                val fc = File(dir, "fcamera.hevc")
+                val ql = File(dir, "qlog.zst")
+                val ec = File(dir, "ecamera.hevc")
+                if (fc.exists()) videoUri = Uri.fromFile(fc)
+                if (ec.exists()) wideUri = Uri.fromFile(ec)
+                if (ql.exists()) logUri = Uri.fromFile(ql)
+                refreshPlayBtn()
+                if (videoUri != null && logUri != null) runReplay()
+            }
+        }.start()
+    }
+
+    private fun startRouteDownload(r: RouteEntry, col: String, url: String) {
+        Thread {
+            try {
+                val dir = File(getExternalFilesDir(null), "routes/${r.route}")
+                dir.mkdirs()
+                val ext = if (col == "qlog" || col == "rlog") ".zst"
+                          else if (col == "qcamera") ".ts" else ".hevc"
+                val out = File(dir, "$col$ext")
+                runOnUiThread { status.text = "下载 $col …" }
+                download(url, out)
+                runOnUiThread {
+                    status.text = "已下载:${out.name} (${out.length()/1024/1024} MB) → ${dir.path}"
+                    if (col == "fcamera") { videoUri = Uri.fromFile(out); refreshPlayBtn() }
+                    if (col == "ecamera") { wideUri = Uri.fromFile(out); refreshPlayBtn() }
+                    if (col == "qlog") { logUri = Uri.fromFile(out); refreshPlayBtn() }
+                    if (videoUri != null && logUri != null) runReplay()
+                }
+            } catch (e: Exception) {
+                runOnUiThread { status.text = "下载失败:${e.message}" }
+            }
+        }.start()
+    }
+
+    private fun download(urlStr: String, out: File) {
+        val u = if (urlStr.startsWith("http")) urlStr else (baseHost ?: "") + urlStr
+        val c = (URL(u).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8000; readTimeout = 120000
+        }
+        c.inputStream.use { input -> FileOutputStream(out).use { input.copyTo(it) } }
+    }
+
+    private fun httpGet(urlStr: String): String {
+        val c = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 8000; readTimeout = 20000
+        }
+        return c.inputStream.bufferedReader().readText()
+    }
+
+    // =====================================================================
+    //  playback + parsing
+    // =====================================================================
+
+    private fun refreshPlayBtn() {
+        val ok = videoUri != null && logUri != null
+        btnPlay.isEnabled = ok
+        btnExt.isEnabled = videoUri != null
+    }
+
+    /** Open the raw video with an external player (MX Player etc.) — these all handle HEVC raw. */
+    private fun openExternally() {
+        val v = videoUri ?: return
+        try {
+            val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                setDataAndType(v, "video/*")
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(android.content.Intent.createChooser(intent, "选择播放器"))
+        } catch (e: Exception) {
+            toast("没有可用的播放器: ${e.message}")
+        }
+    }
+
+    private fun runReplay() {
+        val vUri = videoUri ?: return
+        val lUri = logUri ?: return
+        btnPlay.isEnabled = false
+        status.text = "处理中:复制视频…"
+        Thread {
+            try {
+                val vfRaw = copyToCache(vUri, "video_raw.hevc")
+                val efRaw = wideUri?.let { copyToCache(it, "video_wide_raw.hevc") }
+                // HEVC raw streams are not playable in the WebView; do a hardware transcode
+                // (HEVC decode -> H.264 encode) so the video plays while the signal charts,
+                // blinkers and steering wheel stay visible underneath.
+                runOnUiThread { status.text = "处理中:转码视频(HEVC→H.264)…" }
+                val vf = ensurePlayable(vfRaw) { p ->
+                    runOnUiThread { status.text = "转码前摄… $p%" }
+                }
+                val ef = efRaw?.let {
+                    ensurePlayable(it) { p -> runOnUiThread { status.text = "转码广角… $p%" } }
+                }
+                runOnUiThread { status.text = "处理中:解析日志…" }
+                val lf = copyToCache(lUri, "qlog.zst")
+                val mod = Python.getInstance().getModule("op_parser")
+                val json = mod.callAttr("parse_route", lf.absolutePath, "").toString()
+                runOnUiThread { status.text = "处理中:生成播放页…" }
+                val html = buildHtml(json, vf, ef)
+                runOnUiThread {
+                    web.loadDataWithBaseURL("file://${vf.parentFile!!.absolutePath}/", html, "text/html", "utf-8", null)
+                    val m = Regex("\"samples\":\\s*(\\d+)").find(json)
+                    status.text = "就绪(${m?.groupValues?.get(1) ?: "?"} 采样点)"
+                    btnPlay.isEnabled = true
+                }
+            } catch (e: Exception) {
+                runOnUiThread { status.text = "失败:${e.message}"; btnPlay.isEnabled = true }
+            }
+        }.start()
+    }
+
+    private fun copyToCache(uri: Uri, name: String): File {
+        val f = File(cacheDir, name)
+        contentResolver.openInputStream(uri).use { input ->
+            FileOutputStream(f).use { out -> input!!.copyTo(out) }
+        }
+        return f
+    }
+
+    /**
+     * Make [src] playable by a WebView <video>.
+     *
+     *  - If the file already has an ISO-BMFF (mp4) header we keep it as-is.
+     *  - Otherwise (openpilot HEVC raw Annex-B: fcamera.hevc / ecamera.hevc) we do a REAL
+     *    hardware transcode: HEVC decoder -> H.264 encoder -> mp4. This is what makes the
+     *    video play inside the WebView while the signal charts / blinkers / wheel stay visible
+     *    underneath (that's the whole point of this app).
+     *
+     *  Falls back to returning [src] if anything goes wrong.
+     */
+    private fun ensurePlayable(src: File, outName: String? = null, onProgress: ((Int) -> Unit)? = null): File {
+        // already a container?
+        try {
+            FileInputStream(src).use { ins ->
+                val head = ByteArray(16); val n = ins.read(head)
+                if (n >= 12 && String(head, 4, 4, Charsets.US_ASCII) == "ftyp") return src
+            }
+        } catch (_: Exception) { }
+
+        val name = outName ?: if (src.name.contains("wide")) "video_wide.mp4" else "video.mp4"
+        val out = File(cacheDir, name)
+        if (out.exists()) out.delete()
+        try {
+            return transcodeHevcToAvc(src, out, onProgress)
+        } catch (_: Exception) {
+            return src
+        }
+    }
+
+    /**
+     * Hardware transcode: MediaCodec(HEVC decoder) -> MediaCodec(AVC/H.264 encoder) -> MediaMuxer.
+     * Synchronous loop (dequeueInput/OutputBuffer with a short timeout); fine for a one-shot job
+     * on a background thread.
+     */
+    private fun transcodeHevcToAvc(src: File, out: File, onProgress: ((Int) -> Unit)?): File {
+        val extractor = android.media.MediaExtractor().apply { setDataSource(src.absolutePath) }
+        if (extractor.trackCount == 0) { extractor.release(); return src }
+
+        // pick the video track
+        var vTrack = -1
+        var inFmt: android.media.MediaFormat? = null
+        for (i in 0 until extractor.trackCount) {
+            val f = extractor.getTrackFormat(i)
+            val mime = f.getString(android.media.MediaFormat.KEY_MIME) ?: continue
+            if (mime.startsWith("video/")) { vTrack = i; inFmt = f; break }
+        }
+        if (vTrack < 0 || inFmt == null) { extractor.release(); return src }
+        extractor.selectTrack(vTrack)
+
+        val width = inFmt.getInteger(android.media.MediaFormat.KEY_WIDTH)
+        val height = inFmt.getInteger(android.media.MediaFormat.KEY_HEIGHT)
+        val fps = if (inFmt.containsKey(android.media.MediaFormat.KEY_FRAME_RATE))
+            inFmt.getInteger(android.media.MediaFormat.KEY_FRAME_RATE) else 20
+
+        // H.264 encoder at a sane bitrate. 1928x1208 -> ~6 Mbps keeps it watchable & small.
+        val outFmt = android.media.MediaFormat.createVideoFormat("video/avc", width, height).apply {
+            setInteger(android.media.MediaFormat.KEY_BIT_RATE, 6_000_000)
+            setInteger(android.media.MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT,
+                android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+        }
+        val enc = android.media.MediaCodec.createEncoderByType("video/avc")
+        enc.configure(outFmt, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val inputSurface = enc.createInputSurface()
+        enc.start()
+
+        // EGL bridge: decoder -> SurfaceTexture -> encoder input Surface
+        val egl = EglRenderer(inputSurface, width, height)
+        val dec = android.media.MediaCodec.createDecoderByType(inFmt.getString(android.media.MediaFormat.KEY_MIME)!!)
+        dec.configure(inFmt, egl.decoderSurface, null, 0)
+        dec.start()
+
+        val muxer = android.media.MediaMuxer(out.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var outTrack = -1
+        var muxStarted = false
+
+        val bufInfo = android.media.MediaCodec.BufferInfo()
+        var inputDone = false
+        var outputDone = false
+        var frame = 0
+        val totalUs = if (inFmt.containsKey(android.media.MediaFormat.KEY_DURATION))
+            inFmt.getLong(android.media.MediaFormat.KEY_DURATION) else 0L
+
+        while (!outputDone) {
+            // ---- feed decoder
+            if (!inputDone) {
+                val inIdx = dec.dequeueInputBuffer(10_000)
+                if (inIdx >= 0) {
+                    val ib = dec.getInputBuffer(inIdx)!!
+                    val sz = extractor.readSampleData(ib, 0)
+                    if (sz < 0) {
+                        dec.queueInputBuffer(inIdx, 0, 0, 0, android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                    } else {
+                        val pts = extractor.sampleTime
+                        dec.queueInputBuffer(inIdx, 0, sz, pts, 0)
+                        extractor.advance()
+                    }
+                }
+            }
+            // ---- drain decoder: release to the SurfaceTexture-backed surface
+            val dIdx = dec.dequeueOutputBuffer(bufInfo, 10_000)
+            if (dIdx >= 0) {
+                val eos = (bufInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                val render = bufInfo.size != 0 && !eos
+                dec.releaseOutputBuffer(dIdx, render)
+                if (render) {
+                    egl.awaitNewImage()
+                    egl.drawFrame()
+                    frame++
+                    if (totalUs > 0) onProgress?.invoke(((bufInfo.presentationTimeUs * 100) / totalUs).toInt())
+                }
+                if (eos) enc.signalEndOfInputStream()
+            }
+            // ---- drain encoder -> muxer
+            val eIdx = enc.dequeueOutputBuffer(bufInfo, 10_000)
+            if (eIdx == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                outTrack = muxer.addTrack(enc.outputFormat)
+                muxer.start(); muxStarted = true
+            } else if (eIdx >= 0) {
+                val eb = enc.getOutputBuffer(eIdx)!!
+                if ((bufInfo.flags and android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) bufInfo.size = 0
+                if (bufInfo.size > 0 && muxStarted) {
+                    eb.position(bufInfo.offset); eb.limit(bufInfo.offset + bufInfo.size)
+                    muxer.writeSampleData(outTrack, eb, bufInfo)
+                }
+                enc.releaseOutputBuffer(eIdx, false)
+                if ((bufInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
+            }
+        }
+
+        try { if (muxStarted) muxer.stop() } catch (_: Exception) {}
+        muxer.release(); enc.release(); dec.release()
+        egl.release(); extractor.release()
+        return if (out.length() > 0) out else src
+    }
+
+    private fun buildHtml(signalsJson: String, videoFile: File, wideFile: File? = null): String {
+        val chartJs = assets.open("chart.umd.min.js").bufferedReader().readText()
+        val tpl = assets.open("replay_template.html").bufferedReader().readText()
+        val wideName = wideFile?.name ?: "__CAM_E__"   // leave the placeholder -> JS hides the switch
+        return tpl.replace("__CHARTJS__", chartJs)
+            .replace("__SERIES_JSON__", signalsJson)
+            .replace("__CAM_E__", wideName)
+            .replace("__VIDEO_FILE__", videoFile.name)
+    }
+
+    private fun displayName(uri: Uri): String {
+        var name = "unknown"
+        contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) name = c.getString(idx)
+        }
+        return name
+    }
+
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+}
+
+// =========================================================================
+//  Device page parser
+// =========================================================================
+
+data class RouteEntry(
+    val route: String,
+    val sizeText: String,
+    val ecamera: String?,
+    val fcamera: String?,
+    val qcamera: String?,
+    val qlog: String?,
+    val rlog: String?,
+)
+
+object DevicePageParser {
+
+    // route id: 2026-10-02-10-05-06  (yyyy-mm-dd-HH-MM-SS)
+    private val ROUTE_RE = Pattern.compile("(\\d{4}-\\d{2}-\\d{2}-\\d{2}-\\d{2}-\\d{2})")
+    // href="..."  or  onclick="...'...'" / onclick="...(‘...’)"
+    private val HREF_RE = Pattern.compile("href\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)
+    private val ONCLICK_RE = Pattern.compile("onclick\\s*=\\s*[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE)
+    // capture any url-ish token inside a string
+    private val URLLIKE_RE = Pattern.compile("(https?://[^\\s\"')]+|/[\\w./%?=&-]+)")
+
+    fun parse(base: String, html: String): List<RouteEntry> {
+        // 1) collect all candidate links (href + urls found inside onclick)
+        val links = LinkedHashSet<String>()
+        HREF_RE.matcher(html).let { m -> while (m.find()) links.add(m.group(1)!!) }
+        ONCLICK_RE.matcher(html).let { m ->
+            while (m.find()) {
+                val js = m.group(1)!!
+                val um = URLLIKE_RE.matcher(js)
+                while (um.find()) links.add(um.group(1)!!)
+            }
+        }
+        // also scan raw html for hevc/zst/ts links that may appear anywhere
+        URLLIKE_RE.matcher(html).let { um ->
+            while (um.find()) {
+                val u = um.group(1)!!
+                if (u.endsWith(".hevc") || u.endsWith(".zst") || u.endsWith(".ts") ||
+                    u.contains("download") || u.contains("ecamera") || u.contains("fcamera") ||
+                    u.contains("qlog") || u.contains("rlog") || u.contains("camera"))
+                    links.add(u)
+            }
+        }
+
+        // 2) group by route id
+        val byRoute = LinkedHashMap<String, MutableMap<String, String>>()
+        for (u in links) {
+            val rm = ROUTE_RE.matcher(u)
+            val route = if (rm.find()) rm.group(1)!! else continue
+            val lower = u.lowercase()
+            val slot = when {
+                lower.contains("ecamera") || lower.contains("广角") || lower.contains("wide") -> "ecamera"
+                lower.contains("fcamera") || lower.contains("前摄") || lower.contains("front") -> "fcamera"
+                lower.contains("qcamera") || lower.contains("标清") || lower.contains("qcamera") -> "qcamera"
+                lower.contains("rlog") -> "rlog"
+                lower.contains("qlog") -> "qlog"
+                else -> null
+            }
+            if (slot != null) byRoute.getOrPut(route) { mutableMapOf() }[slot] = u
+        }
+
+        return byRoute.entries.sortedByDescending { it.key }.map { (route, m) ->
+            RouteEntry(
+                route = route,
+                sizeText = "",
+                ecamera = m["ecamera"],
+                fcamera = m["fcamera"],
+                qcamera = m["qcamera"],
+                qlog = m["qlog"],
+                rlog = m["rlog"],
+            )
+        }
+    }
+}
+
+// =========================================================================
+//  Minimal EGL helper: renders decoded video frames onto a MediaCodec input
+//  Surface (the "Surface input" path used for hardware transcoding).
+//
+//  The decoder is configured to output to an external-OES SurfaceTexture; each
+//  frame is then drawn as a full-screen textured quad onto the encoder's input
+//  Surface. This is the standard Android "DecodeEditEncode" pattern, stripped
+//  to the minimum needed for an off-screen, single-threaded transcode.
+// =========================================================================
+
+private class EglRenderer(
+    private val encoderSurface: android.view.Surface,
+    private val texW: Int,
+    private val texH: Int = texW
+) {
+
+    private val display: android.opengl.EGLDisplay
+    private val context: android.opengl.EGLContext
+    private val surface: android.opengl.EGLSurface
+
+    val surfaceTexture: android.graphics.SurfaceTexture
+    val decoderSurface: android.view.Surface
+
+    private var program = 0
+    private var uTexMatrix = 0
+    private var aPos = 0
+    private var aTex = 0
+    private var extTexId = 0
+
+    private val texMatrix = FloatArray(16)
+
+    init {
+        display = android.opengl.EGL14.eglGetDisplay(android.opengl.EGL14.EGL_DEFAULT_DISPLAY)
+        val ver = IntArray(2)
+        if (!android.opengl.EGL14.eglInitialize(display, ver, 0, ver, 1))
+            throw RuntimeException("eglInitialize failed")
+
+        val cfgAttrs = intArrayOf(
+            android.opengl.EGL14.EGL_RED_SIZE, 8,
+            android.opengl.EGL14.EGL_GREEN_SIZE, 8,
+            android.opengl.EGL14.EGL_BLUE_SIZE, 8,
+            android.opengl.EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGL14.EGL_OPENGL_ES2_BIT,
+            0x3142, 1,   // EGL_RECORDABLE_ANDROID
+            android.opengl.EGL14.EGL_NONE
+        )
+        val cfgs = arrayOfNulls<android.opengl.EGLConfig>(1); val n = IntArray(1)
+        if (!android.opengl.EGL14.eglChooseConfig(display, cfgAttrs, 0, cfgs, 0, 1, n, 0) || n[0] == 0)
+            throw RuntimeException("eglChooseConfig failed")
+        val ctxAttrs = intArrayOf(android.opengl.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, android.opengl.EGL14.EGL_NONE)
+        context = android.opengl.EGL14.eglCreateContext(display, cfgs[0], android.opengl.EGL14.EGL_NO_CONTEXT, ctxAttrs, 0)
+        val sAttrs = intArrayOf(android.opengl.EGL14.EGL_NONE)
+        surface = android.opengl.EGL14.eglCreateWindowSurface(display, cfgs[0], encoderSurface, sAttrs, 0)
+        checkEgl()
+        makeCurrent()
+
+        surfaceTexture = android.graphics.SurfaceTexture(0)
+        surfaceTexture.setDefaultBufferSize(texW, texH)
+        decoderSurface = android.view.Surface(surfaceTexture)
+
+        // create the external texture the SurfaceTexture will feed, and bind it to unit 0
+        val texIds = IntArray(1)
+        android.opengl.GLES20.glGenTextures(1, texIds, 0)
+        extTexId = texIds[0]
+        android.opengl.GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, extTexId)
+        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MIN_FILTER, android.opengl.GLES20.GL_LINEAR)
+        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MAG_FILTER, android.opengl.GLES20.GL_LINEAR)
+        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_S, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
+        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_T, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
+        surfaceTexture.attachToGLContext(extTexId)
+
+        program = buildProgram()
+        uTexMatrix = android.opengl.GLES20.glGetUniformLocation(program, "uTexMatrix")
+        aPos = android.opengl.GLES20.glGetAttribLocation(program, "aPos")
+        aTex = android.opengl.GLES20.glGetAttribLocation(program, "aTex")
+    }
+
+    private fun checkEgl() {
+        val e = android.opengl.EGL14.eglGetError()
+        if (e != android.opengl.EGL14.EGL_SUCCESS) throw RuntimeException("EGL error 0x${Integer.toHexString(e)}")
+    }
+
+    private fun makeCurrent() {
+        if (!android.opengl.EGL14.eglMakeCurrent(display, surface, surface, context))
+            throw RuntimeException("eglMakeCurrent failed")
+    }
+
+    /** pull the latest decoded frame into the external texture and update its transform. */
+    fun awaitNewImage() {
+        surfaceTexture.updateTexImage()
+        surfaceTexture.getTransformMatrix(texMatrix)
+    }
+
+    fun drawFrame() {
+        makeCurrent()
+        android.opengl.GLES20.glViewport(0, 0, texW, texH)
+        android.opengl.GLES20.glClearColor(0f, 0f, 0f, 1f)
+        android.opengl.GLES20.glClear(android.opengl.GLES20.GL_COLOR_BUFFER_BIT)
+        android.opengl.GLES20.glUseProgram(program)
+        android.opengl.GLES20.glActiveTexture(android.opengl.GLES20.GL_TEXTURE0)
+        android.opengl.GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, extTexId)
+        android.opengl.GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0)
+        drawQuad()
+        if (!android.opengl.EGL14.eglSwapBuffers(display, surface))
+            throw RuntimeException("eglSwapBuffers failed")
+    }
+
+    private fun drawQuad() {
+        val verts = java.nio.ByteBuffer.allocateDirect(QUAD_VERTS.size * 4)
+            .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().apply { put(QUAD_VERTS); position(0) }
+        val tex = java.nio.ByteBuffer.allocateDirect(QUAD_TEX.size * 4)
+            .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().apply { put(QUAD_TEX); position(0) }
+        verts.position(0); tex.position(0)
+        android.opengl.GLES20.glEnableVertexAttribArray(aPos)
+        android.opengl.GLES20.glVertexAttribPointer(aPos, 2, android.opengl.GLES20.GL_FLOAT, false, 0, verts)
+        android.opengl.GLES20.glEnableVertexAttribArray(aTex)
+        android.opengl.GLES20.glVertexAttribPointer(aTex, 2, android.opengl.GLES20.GL_FLOAT, false, 0, tex)
+        android.opengl.GLES20.glDrawArrays(android.opengl.GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        android.opengl.GLES20.glDisableVertexAttribArray(aPos)
+        android.opengl.GLES20.glDisableVertexAttribArray(aTex)
+    }
+
+    private fun buildProgram(): Int {
+        val vs = """
+            attribute vec4 aPos;
+            attribute vec2 aTex;
+            uniform mat4 uTexMatrix;
+            varying vec2 vTex;
+            void main(){ gl_Position = aPos; vTex = (uTexMatrix * vec4(aTex,0.0,1.0)).xy; }
+        """.trimIndent()
+        val fs = """
+            #extension GL_OES_EGL_image_external : require
+            precision mediump float;
+            uniform samplerExternalOES sTex;
+            varying vec2 vTex;
+            void main(){ gl_FragColor = texture2D(sTex, vTex); }
+        """.trimIndent()
+        val v = compile(android.opengl.GLES20.GL_VERTEX_SHADER, vs)
+        val f = compile(android.opengl.GLES20.GL_FRAGMENT_SHADER, fs)
+        val p = android.opengl.GLES20.glCreateProgram()
+        android.opengl.GLES20.glAttachShader(p, v)
+        android.opengl.GLES20.glAttachShader(p, f)
+        android.opengl.GLES20.glBindAttribLocation(p, 0, "aPos")
+        android.opengl.GLES20.glBindAttribLocation(p, 1, "aTex")
+        android.opengl.GLES20.glLinkProgram(p)
+        android.opengl.GLES20.glUseProgram(p)
+        // texture unit 0 for the external texture sampler
+        val loc = android.opengl.GLES20.glGetUniformLocation(p, "sTex")
+        android.opengl.GLES20.glUniform1i(loc, 0)
+        return p
+    }
+
+    private fun compile(type: Int, src: String): Int {
+        val s = android.opengl.GLES20.glCreateShader(type)
+        android.opengl.GLES20.glShaderSource(s, src)
+        android.opengl.GLES20.glCompileShader(s)
+        val ok = IntArray(1)
+        android.opengl.GLES20.glGetShaderiv(s, android.opengl.GLES20.GL_COMPILE_STATUS, ok, 0)
+        if (ok[0] == 0) throw RuntimeException("shader compile: " + android.opengl.GLES20.glGetShaderInfoLog(s))
+        return s
+    }
+
+    fun release() {
+        try { surfaceTexture.release() } catch (_: Exception) {}
+        try { decoderSurface.release() } catch (_: Exception) {}
+        android.opengl.EGL14.eglDestroySurface(display, surface)
+        android.opengl.EGL14.eglDestroyContext(display, context)
+        android.opengl.EGL14.eglTerminate(display)
+    }
+
+    companion object {
+        private val QUAD_VERTS = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+        private val QUAD_TEX = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
+    }
+}
