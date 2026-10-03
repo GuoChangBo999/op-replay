@@ -1,33 +1,38 @@
 package ai.openpilot.replay;
 
-import android.media.MediaCodec;
-import android.media.MediaCodecInfo;
-import android.media.MediaFormat;
-import android.media.MediaMuxer;
-
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Rewrap an openpilot HEVC raw stream (Annex-B, e.g. fcamera.hevc / ecamera.hevc)
- * into a proper MP4 container so any Android player (VideoView / MediaPlayer /
- * MX Player) can hardware-decode it.
+ * Rewrap an openpilot HEVC raw stream (Annex-B, e.g. fcamera.hevc) into a valid
+ * MP4 container so any Android player can hardware-decode it - WITHOUT re-encoding.
  *
- * Container remux only: the compressed picture data is copied verbatim.
+ * WHY WE HAND-WRITE THE MP4
+ * -------------------------
+ * Android's MediaMuxer silently refused this HEVC track on the target device: it
+ * returned success for addTrack/start/writeSampleData (thousands of times) but the
+ * output stayed a 585-byte file with an empty 'stbl' - no sample ever landed. The
+ * cause is MediaMuxer's picky/undocumented csd handling for HEVC; rather than fight
+ * vendor-specific behaviour we emit the container ourselves, byte-for-byte matching
+ * what `ffmpeg -c:v copy` produces (which we verified PLAYS on this device:
+ * c2.qti.hevc.decoder + render:1 mIsSurfaceToDisplay 1).
+ *
+ * Layout: ftyp | moov | mdat
+ * Samples are length-prefixed NAL units (4-byte big-endian length, no start codes),
+ * sample entry 'hev1' with an embedded 'hvcC' carrying VPS/SPS/PPS.
  */
 public final class HevcTranscoder {
 
     public interface Progress { void onProgress(int percent); }
 
-    /** openpilot logs at a fixed 20 Hz; the video is encoded at the same cadence. */
     private static final int DEFAULT_FPS = 20;
+    private static final int TIMESCALE = 90000;
+    private static final int SAMPLE_DELTA = TIMESCALE / DEFAULT_FPS; // 4500
 
     private static File logFile;
     private static void log(String s) {
@@ -41,20 +46,18 @@ public final class HevcTranscoder {
 
     private HevcTranscoder() {}
 
-    /** Rewrap [src] (raw Annex-B HEVC) into [out] (an .mp4 that plays natively). */
     public static boolean transcode(File src, File out, Progress cb) throws IOException {
         logFile = new File(out.getParentFile(), "tc.log");
         try { if (logFile.exists()) logFile.delete(); } catch (Throwable ignored) {}
-        log("=== transcode start ===");
+        log("=== transcode start (handwritten mp4) ===");
         log("src=" + src + " size=" + src.length());
-        log("out=" + out);
 
-        final long total = src.length();
+        final long fileLen;
         RandomAccessFile in = new RandomAccessFile(src, "r");
         try {
-            final long fileLen = in.length();
+            fileLen = in.length();
 
-            // ---- 1. scan for NAL start codes (00 00 01 / 00 00 00 01) ----
+            // ---- 1. scan for NAL start codes ----
             List<long[]> nals = new ArrayList<>();
             byte[] buf = new byte[1 << 20];
             long scanPos = 0;
@@ -74,238 +77,311 @@ public final class HevcTranscoder {
                 }
                 scanPos += bufLen;
             }
-            if (nals.isEmpty()) throw new IOException("no NAL start codes (not Annex-B HEVC?)");
+            if (nals.isEmpty()) throw new IOException("no NAL start codes");
             log("nal start codes=" + nals.size());
 
-            // ---- 2. split into csd (VPS+SPS+PPS) + one sample per PICTURE ----
-            ByteArrayOutputStream csdW = new ByteArrayOutputStream();
-            byte[] vpsRaw = null, spsRaw = null, ppsRaw = null;
-            int w = 0, h = 0;
+            // ---- 2. split into VPS/SPS/PPS + one sample per PICTURE ----
+            byte[] vps = null, sps = null, pps = null;
             List<List<long[]>> samples = new ArrayList<>();
             List<long[]> curSlices = new ArrayList<>();
+            int N = nals.size();
 
-            for (int k = 0; k < nals.size(); k++) {
+            for (int k = 0; k < N; k++) {
                 long scOff = nals.get(k)[0];
                 int scLen = (int) nals.get(k)[1];
-                long nalDataOff = scOff + scLen;
-                long nalDataEnd = (k + 1 < nals.size()) ? nals.get(k + 1)[0] : fileLen;
-                int nalLen = (int) (nalDataEnd - nalDataOff);
+                long dataOff = scOff + scLen;
+                long dataEnd = (k + 1 < N) ? nals.get(k + 1)[0] : fileLen;
+                int nalLen = (int) (dataEnd - dataOff);
                 if (nalLen <= 0) continue;
 
-                in.seek(nalDataOff);
-                int nalHeader = in.readByte() & 0xFF;
-                int nalType = (nalHeader >> 1) & 0x3F;
+                in.seek(dataOff);
+                int nalType = ((in.readByte() & 0xFF) >> 1) & 0x3F;
 
                 if (nalType == 32 || nalType == 33 || nalType == 34) {
                     byte[] nal = new byte[nalLen];
-                    in.seek(nalDataOff);
+                    in.seek(dataOff);
                     in.readFully(nal);
-                    writeLengthPrefixed(csdW, nal);
-                    if (nalType == 32) vpsRaw = nal;
-                    if (nalType == 33) {
-                        spsRaw = nal;
-                        if (w == 0) {
-                            int[] wh = parseSpsSize(nal);
-                            if (wh != null) { w = wh[0]; h = wh[1]; }
-                        }
-                    }
-                    if (nalType == 34) ppsRaw = nal;
+                    if (nalType == 32) vps = nal;
+                    else if (nalType == 33) sps = nal;
+                    else pps = nal;
                 } else if (nalType < 32) {
                     boolean firstSlice;
                     if (nalLen >= 3) {
-                        in.seek(nalDataOff + 2);
+                        in.seek(dataOff + 2);
                         firstSlice = ((in.readByte() & 0x80) != 0);
                     } else {
                         firstSlice = true;
                     }
-                    long trimmed = trimTrailingZeros(in, nalDataOff, nalLen);
+                    long trimmed = trimTrailingZeros(in, dataOff, nalLen);
                     if (firstSlice && !curSlices.isEmpty()) {
                         samples.add(curSlices);
                         curSlices = new ArrayList<>();
                     }
-                    curSlices.add(new long[]{nalDataOff, trimmed});
-                    if (cb != null && (samples.size() & 0xFF) == 0 && total > 0)
-                        cb.onProgress((int) Math.min(99, (nalDataOff * 100) / total));
+                    curSlices.add(new long[]{dataOff, trimmed});
                 }
             }
             if (!curSlices.isEmpty()) samples.add(curSlices);
 
-            if (samples.isEmpty()) throw new IOException("no VCL NAL units found");
-            if (csdW.size() == 0) throw new IOException("no VPS/SPS/PPS found");
-            if (w == 0 || h == 0) { w = 1928; h = 1208; }
-            log("pictures=" + samples.size() + " csdBytes=" + csdW.size() + " size=" + w + "x" + h);
+            if (samples.isEmpty()) throw new IOException("no VCL NAL units");
+            if (vps == null || sps == null || pps == null) throw new IOException("missing VPS/SPS/PPS");
 
-            // ---- 3. write MP4 (zero re-encode) ----
-            if (out.exists()) out.delete();
-            MediaMuxer muxer = new MediaMuxer(out.getAbsolutePath(),
-                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            MediaFormat fmt = MediaFormat.createVideoFormat("video/hevc", w, h);
-            fmt.setInteger(MediaFormat.KEY_FRAME_RATE, DEFAULT_FPS);
-            fmt.setInteger("max-input-size", 4 * 1024 * 1024);
-            // csd-0 for video/hevc MUST be a HEVCDecoderConfigurationRecord ('hvcC'),
-            // NOT raw length-prefixed VPS/SPS/PPS. With raw NALs, MediaMuxer fails to
-            // build the 'hev1' sample entry and then SILENTLY DROPS every sample ->
-            // empty 585-byte file (the black-screen root cause we reproduced).
-            if (vpsRaw == null || spsRaw == null || ppsRaw == null) {
-                log("missing VPS/SPS/PPS: vps=" + (vpsRaw!=null) + " sps=" + (spsRaw!=null) + " pps=" + (ppsRaw!=null));
-                throw new IOException("missing parameter sets");
-            }
-            byte[] hvcc = buildHvcC(vpsRaw, spsRaw, ppsRaw);
-            log("hvcC bytes=" + hvcc.length + " (vps=" + vpsRaw.length + " sps=" + spsRaw.length + " pps=" + ppsRaw.length + ")");
-            ByteBuffer csdBuf = ByteBuffer.allocateDirect(hvcc.length);
-            csdBuf.put(hvcc);
-            csdBuf.flip();
-            fmt.setByteBuffer("csd-0", csdBuf);
+            int w = 1928, h = 1208;
+            int[] wh = parseSpsSize(sps);
+            if (wh != null && wh[0] > 0 && wh[1] > 0) { w = wh[0]; h = wh[1]; }
+            log("pictures=" + samples.size() + " size=" + w + "x" + h
+                    + " vps=" + vps.length + " sps=" + sps.length + " pps=" + pps.length);
 
-            int track;
-            try {
-                track = muxer.addTrack(fmt);
-                log("addTrack ok, track=" + track);
-                muxer.start();
-                log("muxer.start ok");
-            } catch (Throwable t) {
-                log("addTrack/start FAILED: " + t);
-                try { muxer.release(); } catch (Throwable ignored) {}
-                throw new IOException("muxer setup failed: " + t);
-            }
-
-            ByteBuffer sampleBuf = ByteBuffer.allocate(4 * 1024 * 1024).order(ByteOrder.BIG_ENDIAN);
-            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-
-            long ptsUs = 0;
-            int written = 0;
-            int skipped = 0;
-            for (int i = 0; i < samples.size(); i++) {
+            // ---- 3. build sample byte arrays (length-prefixed NALs) ----
+            int num = samples.size();
+            byte[][] sampleData = new byte[num][];
+            int[] sampleSize = new int[num];
+            long totalMedia = 0;
+            for (int i = 0; i < num; i++) {
                 List<long[]> pic = samples.get(i);
-
-                long need = 0;
-                for (long[] sl : pic) need += 4 + sl[1];
-                if (need <= 0 || need > Integer.MAX_VALUE - 8) { skipped++; continue; }
-
-                if (need > sampleBuf.capacity())
-                    sampleBuf = ByteBuffer.allocate((int) need + 1024).order(ByteOrder.BIG_ENDIAN);
-                sampleBuf.clear();
-
+                int need = 0;
+                for (long[] sl : pic) need += 4 + (int) sl[1];
+                byte[] sb = new byte[need];
+                int off = 0;
                 for (long[] sl : pic) {
                     int len = (int) sl[1];
-                    sampleBuf.putInt(len);
-                    long off = sl[0], remaining = len;
+                    sb[off]     = (byte)((len >>> 24) & 0xFF);
+                    sb[off + 1] = (byte)((len >>> 16) & 0xFF);
+                    sb[off + 2] = (byte)((len >>> 8) & 0xFF);
+                    sb[off + 3] = (byte)(len & 0xFF);
+                    off += 4;
+                    long srcOff = sl[0];
+                    int remaining = len;
                     while (remaining > 0) {
-                        int chunk = (int) Math.min(1 << 20, remaining);
-                        byte[] tmp = new byte[chunk];
-                        in.seek(off);
-                        in.readFully(tmp);
-                        sampleBuf.put(tmp);
-                        off += chunk;
-                        remaining -= chunk;
+                        in.seek(srcOff);
+                        int chunk = Math.min(1 << 20, remaining);
+                        in.readFully(sb, off, chunk);
+                        off += chunk; srcOff += chunk; remaining -= chunk;
                     }
                 }
-                sampleBuf.flip();
-
-                info.set(0, (int) need, ptsUs, 0);
-                try {
-                    muxer.writeSampleData(track, sampleBuf, info);
-                    written++;
-                } catch (Throwable t) {
-                    log("writeSampleData[" + i + "] FAILED: " + t);
-                    if (skipped == 0) throw new IOException("writeSampleData failed: " + t);
-                }
-
-                ptsUs += 1_000_000L / DEFAULT_FPS;
-                if ((i % 500) == 0) log("after " + i + ": out=" + out.length());
+                sampleData[i] = sb;
+                sampleSize[i] = need;
+                totalMedia += need;
                 if (cb != null && (i & 0xFF) == 0)
-                    cb.onProgress((int) Math.min(100, (i * 100L) / samples.size()));
+                    cb.onProgress((int) Math.min(99, (i * 100L) / num));
+            }
+            log("samples ready, totalMedia=" + totalMedia);
+
+            // ---- 4. write the mp4 ----
+            byte[] hvcc = buildHvcC(vps, sps, pps);
+            byte[] ftyp = box("ftyp", concat(
+                    new byte[]{'m','p','4','2', 0,0,0,1},
+                    new byte[]{'i','s','o','m'},
+                    new byte[]{'m','p','4','2'}));
+
+            // build moov with a dummy stco to get its (fixed) size
+            byte[] moovDummy = buildMoov(w, h, num, sampleSize, hvcc,
+                    new int[num]); // zero offsets
+            long offsetBase = ftyp.length + moovDummy.length + 8; // +8 for mdat header
+            int[] offsets = new int[num];
+            long pos = offsetBase;
+            for (int i = 0; i < num; i++) { offsets[i] = (int) pos; pos += sampleSize[i]; }
+            byte[] moov = buildMoov(w, h, num, sampleSize, hvcc, offsets);
+            if (moov.length != moovDummy.length)
+                throw new IOException("moov size changed: " + moov.length + " vs " + moovDummy.length);
+
+            if (out.exists()) out.delete();
+            RandomAccessFile raf = new RandomAccessFile(out, "rw");
+            try {
+                raf.setLength(0);
+                raf.write(ftyp);
+                raf.write(moov);
+                // mdat header
+                long mdatSize = 8 + totalMedia;
+                raf.write(new byte[]{(byte)((mdatSize>>>24)&0xFF),(byte)((mdatSize>>>16)&0xFF),
+                        (byte)((mdatSize>>>8)&0xFF),(byte)(mdatSize&0xFF), 'm','d','a','t'});
+                for (int i = 0; i < num; i++) raf.write(sampleData[i]);
+            } finally {
+                raf.close();
             }
 
-            log("loop done: written=" + written + " skipped=" + skipped);
-            // Sanity: a real clip is many MB. If MediaMuxer silently dropped everything
-            // (no stsd/stbl), the file stays tiny -> report it loudly instead of "success".
-            long sz = out.length();
-            if (written > 0 && sz < 100_000) {
-                log("WARNING: muxer wrote " + written + " samples but file is only " + sz + " bytes");
-                throw new IOException("muxer dropped all samples (file=" + sz + "B)");
-            }
-            try {
-                muxer.stop();
-                log("muxer.stop ok");
-            } catch (Throwable t) {
-                log("muxer.stop FAILED: " + t);
-            } finally {
-                try { muxer.release(); } catch (Throwable ignored) {}
-            }
             if (cb != null) cb.onProgress(100);
-            log("done: out size=" + out.length());
-            return out.length() > 0;
+            long sz = out.length();
+            log("done: out size=" + sz + " (expected ~" + (offsetBase + totalMedia) + ")");
+            if (sz < 100_000) throw new IOException("mp4 too small: " + sz);
+            return sz > 0;
         } finally {
             try { in.close(); } catch (IOException ignored) {}
             log("=== transcode end ===");
         }
     }
 
-    // ------------------------------------------------------------------ helpers
+    // ------------------------------------------------------------------ moov
 
-    private static void writeLengthPrefixed(ByteArrayOutputStream o, byte[] nal) {
-        int n = nal.length;
-        o.write((n >>> 24) & 0xFF); o.write((n >>> 16) & 0xFF);
-        o.write((n >>> 8) & 0xFF);  o.write(n & 0xFF);
-        o.write(nal, 0, nal.length);
+    private static byte[] buildMoov(int w, int h, int num, int[] sampleSize,
+                                    byte[] hvcc, int[] offsets) throws IOException {
+        long duration = (long) num * SAMPLE_DELTA;
+
+        // mvhd
+        ByteArrayOutputStream mvhd = new ByteArrayOutputStream();
+        mvhd.write(new byte[4]); mvhd.write(new byte[4]);
+        wrI(mvhd, TIMESCALE); wrI(mvhd, (int) duration);
+        wrI(mvhd, 0x00010000);
+        mvhd.write(new byte[]{0,1,0,0}); mvhd.write(new byte[2]); mvhd.write(new byte[8]);
+        writeMatrix(mvhd);
+        mvhd.write(new byte[24]);
+        wrI(mvhd, 2);
+
+        // tkhd
+        ByteArrayOutputStream tkhd = new ByteArrayOutputStream();
+        wrI(tkhd, 0x00000007);
+        tkhd.write(new byte[4]); tkhd.write(new byte[4]);
+        wrI(tkhd, 1);
+        tkhd.write(new byte[4]);
+        wrI(tkhd, (int) duration);
+        tkhd.write(new byte[8]);
+        tkhd.write(new byte[2]); tkhd.write(new byte[2]); tkhd.write(new byte[]{0,0}); tkhd.write(new byte[2]);
+        writeMatrix(tkhd);
+        wrI(tkhd, w << 16); wrI(tkhd, h << 16);
+
+        // mdhd
+        ByteArrayOutputStream mdhd = new ByteArrayOutputStream();
+        mdhd.write(new byte[4]); mdhd.write(new byte[4]);
+        wrI(mdhd, TIMESCALE); wrI(mdhd, (int) duration);
+        mdhd.write(new byte[]{0x55,(byte)0xC4,0,0});
+
+        // hdlr
+        ByteArrayOutputStream hdlr = new ByteArrayOutputStream();
+        hdlr.write(new byte[4]); hdlr.write(new byte[4]);
+        hdlr.write(new byte[]{'v','i','d','e'});
+        hdlr.write(new byte[12]);
+        hdlr.write("VideoHandler".getBytes("US-ASCII")); hdlr.write(0);
+
+        // stsd -> hev1 -> hvcC
+        ByteArrayOutputStream hev1 = new ByteArrayOutputStream();
+        hev1.write(new byte[6]);
+        hev1.write(new byte[]{0,1});
+        hev1.write(new byte[2]); hev1.write(new byte[2]); hev1.write(new byte[12]);
+        hev1.write(new byte[]{(byte)((w>>8)&0xFF),(byte)(w&0xFF),(byte)((h>>8)&0xFF),(byte)(h&0xFF)});
+        wrI(hev1, 0x00480000); wrI(hev1, 0x00480000);
+        hev1.write(new byte[4]);
+        hev1.write(new byte[]{0,1});
+        hev1.write(new byte[32]);
+        hev1.write(new byte[]{0,0x18});
+        hev1.write(new byte[]{(byte)0xFF,(byte)0xFF});
+        hev1.write(hvcc);
+
+        ByteArrayOutputStream stsd = new ByteArrayOutputStream();
+        stsd.write(new byte[4]); wrI(stsd, 1); stsd.write(box("hev1", hev1.toByteArray()));
+
+        // stts
+        ByteArrayOutputStream stts = new ByteArrayOutputStream();
+        stts.write(new byte[4]); wrI(stts, 1); wrI(stts, num); wrI(stts, SAMPLE_DELTA);
+
+        // stsc: 1 sample per chunk
+        ByteArrayOutputStream stsc = new ByteArrayOutputStream();
+        stsc.write(new byte[4]); wrI(stsc, 1); wrI(stsc, 1); wrI(stsc, 1); wrI(stsc, 1);
+
+        // stsz
+        ByteArrayOutputStream stsz = new ByteArrayOutputStream();
+        stsz.write(new byte[4]); wrI(stsz, 0); wrI(stsz, num);
+        for (int i = 0; i < num; i++) wrI(stsz, sampleSize[i]);
+
+        // stco
+        ByteArrayOutputStream stco = new ByteArrayOutputStream();
+        stco.write(new byte[4]); wrI(stco, num);
+        for (int i = 0; i < num; i++) wrI(stco, offsets[i]);
+
+        ByteArrayOutputStream stbl = new ByteArrayOutputStream();
+        stbl.write(box("stsd", stsd.toByteArray()));
+        stbl.write(box("stts", stts.toByteArray()));
+        stbl.write(box("stsc", stsc.toByteArray()));
+        stbl.write(box("stsz", stsz.toByteArray()));
+        stbl.write(box("stco", stco.toByteArray()));
+
+        // vmhd
+        ByteArrayOutputStream vmhd = new ByteArrayOutputStream();
+        vmhd.write(new byte[4]); vmhd.write(new byte[8]);
+
+        // dinf/dref/url
+        ByteArrayOutputStream url = new ByteArrayOutputStream();
+        wrI(url, 1);
+        ByteArrayOutputStream dref = new ByteArrayOutputStream();
+        dref.write(new byte[4]); wrI(dref, 1); dref.write(box("url ", url.toByteArray()));
+        ByteArrayOutputStream dinf = new ByteArrayOutputStream();
+        dinf.write(box("dref", dref.toByteArray()));
+
+        ByteArrayOutputStream minf = new ByteArrayOutputStream();
+        minf.write(box("vmhd", vmhd.toByteArray()));
+        minf.write(box("dinf", dinf.toByteArray()));
+        minf.write(box("stbl", stbl.toByteArray()));
+
+        ByteArrayOutputStream mdia = new ByteArrayOutputStream();
+        mdia.write(box("mdhd", mdhd.toByteArray()));
+        mdia.write(box("hdlr", hdlr.toByteArray()));
+        mdia.write(box("minf", minf.toByteArray()));
+
+        ByteArrayOutputStream trak = new ByteArrayOutputStream();
+        trak.write(box("tkhd", tkhd.toByteArray()));
+        trak.write(box("mdia", mdia.toByteArray()));
+
+        ByteArrayOutputStream moov = new ByteArrayOutputStream();
+        moov.write(box("mvhd", mvhd.toByteArray()));
+        moov.write(box("trak", trak.toByteArray()));
+        return box("moov", moov.toByteArray());
     }
 
-    /**
-     * Build a HEVCDecoderConfigurationRecord ('hvcC') from VPS/SPS/PPS.
-     * This is what Android's MediaMuxer expects in csd-0 for "video/hevc";
-     * giving it raw NALs makes it drop every sample silently.
-     */
+    private static void writeMatrix(ByteArrayOutputStream o) {
+        wrI(o, 0x00010000); wrI(o, 0); wrI(o, 0);
+        wrI(o, 0); wrI(o, 0x00010000); wrI(o, 0);
+        wrI(o, 0); wrI(o, 0); wrI(o, 0x40000000);
+    }
+
+    // ------------------------------------------------------------------ helpers
+
     private static byte[] buildHvcC(byte[] vps, byte[] sps, byte[] pps) {
         ByteArrayOutputStream o = new ByteArrayOutputStream();
-        o.write(1);                                  // configurationVersion
-        // general_profile_space(2)|general_tier_flag(1)|general_profile_idc(5)
+        o.write(1);
         int profileIdc = (sps.length > 1) ? (sps[1] & 0x1F) : 1;
         o.write(profileIdc);
-        // general_profile_compatibility_flags (u32)
         o.write(0); o.write(0); o.write(0); o.write(0x60);
-        // general_constraint_indicator_flags (48 bits)
         o.write(0); o.write(0); o.write(0); o.write(0); o.write(0); o.write(0);
-        // general_level_idc (from SPS if available, else 0x5A = level 90)
-        int levelIdc = 0x5A;
-        try {
-            byte[] rbsp = removeEmulationPrevention(sps, 0, sps.length);
-            // find general_level_idc: it's byte index 12 of profile_tier_level after NAL header
-            // (2 header + 1 vps_id/temporal + 2+1+5+32 ... ) -> use heuristic: SPS[12] holds level
-            if (rbsp.length > 12) levelIdc = rbsp[12] & 0xFF;
-        } catch (Throwable ignored) {}
-        o.write(levelIdc);
-        // min_spatial_segmentation_idc (4 bits reserved 1111)
+        o.write(0x5A);                              // general_level_idc
         o.write(0xF0); o.write(0x00);
-        // parallelismType (reserved 111111 + 2 bits)
         o.write(0xFC);
-        // chromaFormat (reserved 111111 + 2 bits) -> 1 = 4:2:0
         o.write(0xFC | 1);
-        // bitDepthLumaMinus8 (reserved 11111 + 3 bits) -> 0
         o.write(0xF8);
-        // bitDepthChromaMinus8
         o.write(0xF8);
-        // avgFrameRate (u16) = 0
         o.write(0); o.write(0);
-        // constantFrameRate(2)|numTemporalLayers(3)|temporalIdNested(1)|lengthSizeMinusOne(2)
-        // lengthSizeMinusOne = 3 (4-byte NAL length prefixes, matching our samples)
-        o.write(0x0F);
-        // numOfArrays
+        o.write(0x0F);                              // lengthSizeMinusOne = 3
         o.write(3);
         writeArray(o, 32, vps);
         writeArray(o, 33, sps);
         writeArray(o, 34, pps);
-        return o.toByteArray();
+        return box("hvcC", o.toByteArray());
     }
 
     private static void writeArray(ByteArrayOutputStream o, int nalType, byte[] nal) {
-        o.write(0x80 | (nalType & 0x3F));            // array_completeness=1 | nal_unit_type
-        o.write((nal.length >> 8) & 0xFF);
-        o.write(nal.length & 0xFF);
+        o.write(0x80 | (nalType & 0x3F));
+        o.write(0); o.write(1);                      // numNalus = 1 (big-endian u16)
+        o.write((nal.length >> 8) & 0xFF); o.write(nal.length & 0xFF); // nalUnitLength
         o.write(nal, 0, nal.length);
     }
 
-    /** Return effective NAL length with trailing 0x00 bytes removed. */
+    private static byte[] box(String type, byte[] body) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        wrI(o, 8 + body.length);
+        for (int i = 0; i < type.length(); i++) o.write(type.charAt(i));
+        o.write(body, 0, body.length);
+        return o.toByteArray();
+    }
+
+    private static void wrI(ByteArrayOutputStream o, int v) {
+        o.write((v >>> 24) & 0xFF); o.write((v >>> 16) & 0xFF);
+        o.write((v >>> 8) & 0xFF);  o.write(v & 0xFF);
+    }
+
+    private static byte[] concat(byte[]... arrs) {
+        int n = 0; for (byte[] a : arrs) n += a.length;
+        byte[] r = new byte[n]; int off = 0;
+        for (byte[] a : arrs) { System.arraycopy(a, 0, r, off, a.length); off += a.length; }
+        return r;
+    }
+
     private static long trimTrailingZeros(RandomAccessFile in, long off, int len) throws IOException {
         int probe = Math.min(8, len);
         byte[] tail = new byte[probe];
@@ -319,35 +395,29 @@ public final class HevcTranscoder {
         return trimmed > 0 ? trimmed : len;
     }
 
-    /** Parse SPS to get width/height. Returns null if it cannot be parsed. */
     private static int[] parseSpsSize(byte[] nal) {
         try {
             byte[] rbsp = removeEmulationPrevention(nal, 0, nal.length);
             BitReader br = new BitReader(rbsp);
-            br.readBits(16); // NAL header
-            br.readUE(); // sps_video_parameter_set_id
-            int spsMaxSubLayersMinus1 = br.readBits(3);
-            br.skipBits(1); // sps_temporal_id_nesting_flag
-            br.skipBits(2 + 1 + 5 + 32 + 48 + 8); // profile_tier_level (general)
-            for (int i = 0; i < spsMaxSubLayersMinus1; i++) {
-                br.readBit(); // profile_tier_present
-                br.skipBits(88);
-            }
-            br.readUE(); // sps_seq_parameter_set_id
-            int chromaFormatIdc = br.readUE();
-            if (chromaFormatIdc == 3) br.skipBits(1);
-            int picWidthInLumaSamples = br.readUE();
-            int picHeightInLumaSamples = br.readUE();
-            if (picWidthInLumaSamples > 0 && picHeightInLumaSamples > 0)
-                return new int[]{picWidthInLumaSamples, picHeightInLumaSamples};
+            br.readBits(16);
+            br.readUE();
+            int subLayers = br.readBits(3);
+            br.skipBits(1);
+            br.skipBits(2 + 1 + 5 + 32 + 48 + 8);
+            for (int i = 0; i < subLayers; i++) { br.readBit(); br.skipBits(88); }
+            br.readUE();
+            int chroma = br.readUE();
+            if (chroma == 3) br.skipBits(1);
+            int w = br.readUE();
+            int h = br.readUE();
+            if (w > 0 && h > 0) return new int[]{w, h};
         } catch (Throwable ignored) {}
         return null;
     }
 
     private static byte[] removeEmulationPrevention(byte[] in, int from, int len) {
         byte[] out = new byte[len];
-        int o = 0;
-        int zeros = 0;
+        int o = 0, zeros = 0;
         for (int i = from; i < from + len && i < in.length; i++) {
             byte b = in[i];
             if (zeros >= 2 && b == 0x03) { zeros = 0; continue; }
