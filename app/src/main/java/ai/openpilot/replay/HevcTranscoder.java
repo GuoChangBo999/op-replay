@@ -218,10 +218,13 @@ public final class HevcTranscoder {
 
         // mvhd
         ByteArrayOutputStream mvhd = new ByteArrayOutputStream();
-        mvhd.write(new byte[4]); mvhd.write(new byte[4]);
+        mvhd.write(new byte[4]);                 // version(0) + flags
+        mvhd.write(new byte[4]);                 // creation_time
+        mvhd.write(new byte[4]);                 // modification_time
         wrI(mvhd, TIMESCALE); wrI(mvhd, (int) duration);
-        wrI(mvhd, 0x00010000);
-        mvhd.write(new byte[]{0,1,0,0}); mvhd.write(new byte[2]); mvhd.write(new byte[8]);
+        wrI(mvhd, 0x00010000);                  // rate
+        mvhd.write(new byte[]{0x01,0,0,0});     // volume(0x0100) + reserved(2)
+        mvhd.write(new byte[8]);                // reserved 2 x u32
         writeMatrix(mvhd);
         mvhd.write(new byte[24]);
         wrI(mvhd, 2);
@@ -240,7 +243,9 @@ public final class HevcTranscoder {
 
         // mdhd
         ByteArrayOutputStream mdhd = new ByteArrayOutputStream();
-        mdhd.write(new byte[4]); mdhd.write(new byte[4]);
+        mdhd.write(new byte[4]);                 // version(0) + flags
+        mdhd.write(new byte[4]);                 // creation_time
+        mdhd.write(new byte[4]);                 // modification_time
         wrI(mdhd, TIMESCALE); wrI(mdhd, (int) duration);
         mdhd.write(new byte[]{0x55,(byte)0xC4,0,0});
 
@@ -293,9 +298,9 @@ public final class HevcTranscoder {
         stbl.write(box("stsz", stsz.toByteArray()));
         stbl.write(box("stco", stco.toByteArray()));
 
-        // vmhd
+        // vmhd  (version 0, flags 1)
         ByteArrayOutputStream vmhd = new ByteArrayOutputStream();
-        vmhd.write(new byte[4]); vmhd.write(new byte[8]);
+        wrI(vmhd, 1); vmhd.write(new byte[8]);
 
         // dinf/dref/url
         ByteArrayOutputStream url = new ByteArrayOutputStream();
