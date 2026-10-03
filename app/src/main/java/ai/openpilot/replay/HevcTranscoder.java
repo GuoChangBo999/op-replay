@@ -14,17 +14,30 @@ import java.util.List;
  *
  * WHY WE HAND-WRITE THE MP4
  * -------------------------
- * Android's MediaMuxer silently refused this HEVC track on the target device: it
- * returned success for addTrack/start/writeSampleData (thousands of times) but the
- * output stayed a 585-byte file with an empty 'stbl' - no sample ever landed. The
- * cause is MediaMuxer's picky/undocumented csd handling for HEVC; rather than fight
- * vendor-specific behaviour we emit the container ourselves, byte-for-byte matching
- * what `ffmpeg -c:v copy` produces (which we verified PLAYS on this device:
- * c2.qti.hevc.decoder + render:1 mIsSurfaceToDisplay 1).
+ * Android's MediaMuxer silently refused this HEVC track on the target device, so
+ * we emit the container ourselves, byte-for-byte matching what `ffmpeg -c:v copy`
+ * produces (verified to PLAY on this device: c2.qti.hevc.decoder + render:1).
  *
- * Layout: ftyp | moov | mdat
- * Samples are length-prefixed NAL units (4-byte big-endian length, no start codes),
- * sample entry 'hev1' with an embedded 'hvcC' carrying VPS/SPS/PPS.
+ * MEMORY MODEL (this is the whole point of the v2 rewrite)
+ * -------------------------------------------------------
+ * The previous version kept EVERY sample's bytes in RAM (`byte[][] sampleData`)
+ * plus a `List<long[]>` per NAL; an 800MB fcamera blew the ~512MB app heap and
+ * crashed with OutOfMemoryError (HevcTranscoder.transcode line 147). This version
+ * is STREAMING and O(1) in file size:
+ *
+ *   Pass 1  : scan the file, record only integer metadata:
+ *               - vclOff[]  : byte offset of each VCL NAL payload   (long[])
+ *               - vclLen[]  : trimmed byte length of each VCL NAL   (int[])
+ *               - picture starts (first-slice NAL indices) + types  (int[])
+ *               - VPS/SPS/PPS bytes (tiny)
+ *   Build   : stsz/stts/stss/stsc/stco + moov from the int arrays alone.
+ *   Pass 2  : walk pictures, random-access-read their NALs into a single reused
+ *             1MB staging buffer, write length-prefixed samples straight to disk.
+ *
+ * Peak heap is a few MB regardless of the input being 75MB or 800MB.
+ *
+ * Layout: ftyp | moov | mdat. Samples are length-prefixed NAL units (4-byte BE
+ * length, no start codes); sample entry 'hev1' with embedded 'hvcC'.
  */
 public final class HevcTranscoder {
 
@@ -33,6 +46,7 @@ public final class HevcTranscoder {
     private static final int DEFAULT_FPS = 20;
     private static final int TIMESCALE = 90000;
     private static final int SAMPLE_DELTA = TIMESCALE / DEFAULT_FPS; // 4500
+    private static final int CHUNK_TARGET = 1_000_000;
 
     private static File logFile;
     private static void log(String s) {
@@ -49,19 +63,33 @@ public final class HevcTranscoder {
     public static boolean transcode(File src, File out, Progress cb) throws IOException {
         logFile = new File(out.getParentFile(), "tc.log");
         try { if (logFile.exists()) logFile.delete(); } catch (Throwable ignored) {}
-        log("=== transcode start (handwritten mp4) ===");
+        log("=== transcode start (streaming mp4 v2) ===");
         log("src=" + src + " size=" + src.length());
 
-        final long fileLen;
         RandomAccessFile in = new RandomAccessFile(src, "r");
         try {
-            fileLen = in.length();
+            final long fileLen = in.length();
 
-            // ---- 1. scan for NAL start codes ----
-            List<long[]> nals = new ArrayList<>();
+            // =================================================================
+            //  PASS 1 - scan NAL start codes, record integer metadata only
+            // =================================================================
+            long[] vclOff = new long[1 << 18];   // payload offset per VCL NAL
+            int[]  vclLen = new int[1 << 18];    // trimmed payload length per VCL NAL
+            int nVcl = 0;
+
+            int[] picFirst = new int[4096];      // first VCL-NAL index of each picture
+            int[] picType  = new int[4096];      // first-slice nal_type of each picture
+            int nPic = 0;
+
+            byte[] vps = null, sps = null, pps = null;
+
             byte[] buf = new byte[1 << 20];
             long scanPos = 0;
             int bufLen;
+
+            long pendingScOff = -1;
+            int  pendingScLen = 0;
+
             in.seek(0);
             while ((bufLen = in.read(buf)) > 0) {
                 for (int i = 0; i < bufLen; i++) {
@@ -69,139 +97,119 @@ public final class HevcTranscoder {
                     int i1 = i + 1, i2 = i + 2;
                     if (i2 >= bufLen) continue;
                     if ((buf[i1] & 0xFF) == 0 && (buf[i2] & 0xFF) == 1) {
-                        if (i >= 1 && (buf[i - 1] & 0xFF) == 0)
-                            nals.add(new long[]{scanPos + i - 1, 4});
-                        else
-                            nals.add(new long[]{scanPos + i, 3});
+                        long scOff;
+                        int scLen;
+                        if (i >= 1 && (buf[i - 1] & 0xFF) == 0) { scOff = scanPos + i - 1; scLen = 4; }
+                        else { scOff = scanPos + i; scLen = 3; }
+
+                        if (pendingScOff >= 0) {
+                            long dataOff = pendingScOff + pendingScLen;
+                            int nalLen = (int) (scOff - dataOff);
+                            if (nalLen > 0) {
+                                in.seek(dataOff);
+                                int nalType = ((in.readByte() & 0xFF) >> 1) & 0x3F;
+                                if (nalType == 32 || nalType == 33 || nalType == 34) {
+                                    byte[] nal = new byte[nalLen];
+                                    in.seek(dataOff);
+                                    in.readFully(nal);
+                                    if (nalType == 32) vps = nal;
+                                    else if (nalType == 33) sps = nal;
+                                    else pps = nal;
+                                } else if (nalType < 32) {
+                                    boolean firstSlice;
+                                    if (nalLen >= 3) { in.seek(dataOff + 2); firstSlice = ((in.readByte() & 0x80) != 0); }
+                                    else firstSlice = true;
+                                    int trimmed = (int) trimTrailingZeros(in, dataOff, nalLen);
+
+                                    if (firstSlice) {
+                                        if (nPic == picFirst.length) { picFirst = growI(picFirst); picType = growI(picType); }
+                                        picFirst[nPic] = nVcl;
+                                        picType[nPic] = nalType;
+                                        nPic++;
+                                    }
+                                    if (nVcl == vclOff.length) { vclOff = growL(vclOff); vclLen = growI(vclLen); }
+                                    vclOff[nVcl] = dataOff;
+                                    vclLen[nVcl] = trimmed;
+                                    nVcl++;
+                                }
+                            }
+                        }
+                        pendingScOff = scOff;
+                        pendingScLen = scLen;
                     }
                 }
                 scanPos += bufLen;
             }
-            if (nals.isEmpty()) throw new IOException("no NAL start codes");
-            log("nal start codes=" + nals.size());
-
-            // ---- 2. split into VPS/SPS/PPS + one sample per PICTURE ----
-            byte[] vps = null, sps = null, pps = null;
-            List<List<long[]>> samples = new ArrayList<>();
-            List<Integer> picTypes = new ArrayList<>();   // first-slice nal_type per picture
-            List<long[]> curSlices = new ArrayList<>();
-            int curType = -1;
-            int N = nals.size();
-
-            for (int k = 0; k < N; k++) {
-                long scOff = nals.get(k)[0];
-                int scLen = (int) nals.get(k)[1];
-                long dataOff = scOff + scLen;
-                long dataEnd = (k + 1 < N) ? nals.get(k + 1)[0] : fileLen;
-                int nalLen = (int) (dataEnd - dataOff);
-                if (nalLen <= 0) continue;
-
-                in.seek(dataOff);
-                int nalType = ((in.readByte() & 0xFF) >> 1) & 0x3F;
-
-                if (nalType == 32 || nalType == 33 || nalType == 34) {
-                    byte[] nal = new byte[nalLen];
+            // trailing NAL
+            if (pendingScOff >= 0) {
+                long dataOff = pendingScOff + pendingScLen;
+                int nalLen = (int) (fileLen - dataOff);
+                if (nalLen > 0) {
                     in.seek(dataOff);
-                    in.readFully(nal);
-                    if (nalType == 32) vps = nal;
-                    else if (nalType == 33) sps = nal;
-                    else pps = nal;
-                } else if (nalType < 32) {
-                    boolean firstSlice;
-                    if (nalLen >= 3) {
-                        in.seek(dataOff + 2);
-                        firstSlice = ((in.readByte() & 0x80) != 0);
-                    } else {
-                        firstSlice = true;
+                    int nalType = ((in.readByte() & 0xFF) >> 1) & 0x3F;
+                    if (nalType == 32 || nalType == 33 || nalType == 34) {
+                        byte[] nal = new byte[nalLen];
+                        in.seek(dataOff); in.readFully(nal);
+                        if (nalType == 32) vps = nal; else if (nalType == 33) sps = nal; else pps = nal;
+                    } else if (nalType < 32) {
+                        boolean firstSlice;
+                        if (nalLen >= 3) { in.seek(dataOff + 2); firstSlice = ((in.readByte() & 0x80) != 0); }
+                        else firstSlice = true;
+                        int trimmed = (int) trimTrailingZeros(in, dataOff, nalLen);
+                        if (firstSlice) {
+                            if (nPic == picFirst.length) { picFirst = growI(picFirst); picType = growI(picType); }
+                            picFirst[nPic] = nVcl; picType[nPic] = nalType; nPic++;
+                        }
+                        if (nVcl == vclOff.length) { vclOff = growL(vclOff); vclLen = growI(vclLen); }
+                        vclOff[nVcl] = dataOff; vclLen[nVcl] = trimmed; nVcl++;
                     }
-                    long trimmed = trimTrailingZeros(in, dataOff, nalLen);
-                    if (firstSlice && !curSlices.isEmpty()) {
-                        samples.add(curSlices);
-                        picTypes.add(curType);
-                        curSlices = new ArrayList<>();
-                    }
-                    if (firstSlice) curType = nalType;
-                    curSlices.add(new long[]{dataOff, trimmed});
                 }
             }
-            if (!curSlices.isEmpty()) { samples.add(curSlices); picTypes.add(curType); }
 
-            if (samples.isEmpty()) throw new IOException("no VCL NAL units");
+            if (nPic == 0) throw new IOException("no VCL NAL units");
             if (vps == null || sps == null || pps == null) throw new IOException("missing VPS/SPS/PPS");
+            log("vcl nals=" + nVcl + " pictures=" + nPic);
+
+            // =================================================================
+            //  build sample metadata (int arrays only)
+            // =================================================================
+            final int num = nPic;
+            int[] sampleSize = new int[num];
+            for (int p = 0; p < num; p++) {
+                int from = picFirst[p];
+                int to = (p + 1 < num) ? picFirst[p + 1] : nVcl;
+                int need = 0;
+                for (int k = from; k < to; k++) need += 4 + vclLen[k];
+                sampleSize[p] = need;
+            }
 
             int w = 1928, h = 1208;
             int[] wh = parseSpsSize(sps);
             if (wh != null && wh[0] > 0 && wh[1] > 0) { w = wh[0]; h = wh[1]; }
-            log("pictures=" + samples.size() + " size=" + w + "x" + h
-                    + " vps=" + vps.length + " sps=" + sps.length + " pps=" + pps.length);
+            log("size=" + w + "x" + h + " vps=" + vps.length + " sps=" + sps.length + " pps=" + pps.length);
 
-            // ---- 3. build sample byte arrays (length-prefixed NALs) ----
-            int num = samples.size();
-            byte[][] sampleData = new byte[num][];
-            int[] sampleSize = new int[num];
-            long totalMedia = 0;
-            for (int i = 0; i < num; i++) {
-                List<long[]> pic = samples.get(i);
-                int need = 0;
-                for (long[] sl : pic) need += 4 + (int) sl[1];
-                byte[] sb = new byte[need];
-                int off = 0;
-                for (long[] sl : pic) {
-                    int len = (int) sl[1];
-                    sb[off]     = (byte)((len >>> 24) & 0xFF);
-                    sb[off + 1] = (byte)((len >>> 16) & 0xFF);
-                    sb[off + 2] = (byte)((len >>> 8) & 0xFF);
-                    sb[off + 3] = (byte)(len & 0xFF);
-                    off += 4;
-                    long srcOff = sl[0];
-                    int remaining = len;
-                    while (remaining > 0) {
-                        in.seek(srcOff);
-                        int chunk = Math.min(1 << 20, remaining);
-                        in.readFully(sb, off, chunk);
-                        off += chunk; srcOff += chunk; remaining -= chunk;
-                    }
-                }
-                sampleData[i] = sb;
-                sampleSize[i] = need;
-                totalMedia += need;
-                if (cb != null && (i & 0xFF) == 0)
-                    cb.onProgress((int) Math.min(99, (i * 100L) / num));
-            }
-            log("samples ready, totalMedia=" + totalMedia);
-
-            // ---- 4. write the mp4 ----
-            byte[] hvcc = buildHvcC(vps, sps, pps);
-            byte[] ftyp = box("ftyp", concat(
-                    new byte[]{'m','p','4','2', 0,0,0,1},
-                    new byte[]{'i','s','o','m'},
-                    new byte[]{'m','p','4','2'}));
-
-            // sync samples (IDR/IRAP pictures, 1-based) for stss
-            int[] sync = new int[num];
+            int[] sync = new int[Math.max(16, num / 8)];
             int nSync = 0;
-            for (int i = 0; i < num; i++) {
-                int t = picTypes.get(i);
-                if (t >= 16 && t <= 21) sync[nSync++] = i + 1;
+            for (int p = 0; p < num; p++) {
+                int t = picType[p];
+                if (t >= 16 && t <= 21) {
+                    if (nSync == sync.length) sync = growI(sync);
+                    sync[nSync++] = p + 1;
+                }
             }
             log("sync samples=" + nSync);
 
-            // chunk division like ffmpeg: ~1MB per chunk
-            final int CHUNK_TARGET = 1_000_000;
-            List<int[]> chunks = new ArrayList<>();  // {firstSample, count}
+            List<int[]> chunks = new ArrayList<>();
             {
                 int i = 0;
                 while (i < num) {
                     int acc = 0, start = i;
-                    while (i < num && (acc < CHUNK_TARGET || i == start)) {
-                        acc += sampleSize[i]; i++;
-                    }
+                    while (i < num && (acc < CHUNK_TARGET || i == start)) { acc += sampleSize[i]; i++; }
                     chunks.add(new int[]{start, i - start});
                 }
             }
             int nChunks = chunks.size();
-            // stsc entries: merge consecutive equal counts
-            List<int[]> stscEntries = new ArrayList<>(); // {firstChunk(1-based), samplesPerChunk}
+            List<int[]> stscEntries = new ArrayList<>();
             for (int ci = 0; ci < nChunks; ci++) {
                 int cnt = chunks.get(ci)[1];
                 if (!stscEntries.isEmpty() && stscEntries.get(stscEntries.size() - 1)[1] == cnt) continue;
@@ -209,32 +217,68 @@ public final class HevcTranscoder {
             }
             log("chunks=" + nChunks + " stsc entries=" + stscEntries.size());
 
-            // build moov with a dummy stco to get its (fixed) size
+            // =================================================================
+            //  moov
+            // =================================================================
+            byte[] hvcc = buildHvcC(vps, sps, pps);
+            byte[] ftyp = box("ftyp", concat(
+                    new byte[]{'m','p','4','2', 0,0,0,1},
+                    new byte[]{'i','s','o','m'},
+                    new byte[]{'m','p','4','2'}));
+
             byte[] moovDummy = buildMoov(w, h, num, sampleSize, hvcc,
                     new int[nChunks], sync, nSync, stscEntries);
-            long offsetBase = ftyp.length + moovDummy.length + 8; // +8 for mdat header
-            // sample offsets
-            int[] sampleOff = new int[num];
-            long pos = offsetBase;
-            for (int i = 0; i < num; i++) { sampleOff[i] = (int) pos; pos += sampleSize[i]; }
-            // chunk offsets = first sample offset of each chunk
+            long offsetBase = ftyp.length + moovDummy.length + 8;
+            long totalMedia = 0;
+            for (int i = 0; i < num; i++) totalMedia += sampleSize[i];
+
             int[] chunkOff = new int[nChunks];
-            for (int i = 0; i < nChunks; i++) chunkOff[i] = sampleOff[chunks.get(i)[0]];
+            {
+                long pos = offsetBase;
+                int ci = 0, startOfChunk = 0;
+                for (int i = 0; i < num; i++) {
+                    if (i == startOfChunk) { chunkOff[ci] = (int) pos; ci++; if (ci < nChunks) startOfChunk = chunks.get(ci)[0]; }
+                    pos += sampleSize[i];
+                }
+            }
             byte[] moov = buildMoov(w, h, num, sampleSize, hvcc, chunkOff, sync, nSync, stscEntries);
             if (moov.length != moovDummy.length)
                 throw new IOException("moov size changed: " + moov.length + " vs " + moovDummy.length);
 
+            // =================================================================
+            //  PASS 2 - stream samples to disk (single reused buffer)
+            // =================================================================
             if (out.exists()) out.delete();
             RandomAccessFile raf = new RandomAccessFile(out, "rw");
+            byte[] stage = new byte[1 << 20];
             try {
                 raf.setLength(0);
                 raf.write(ftyp);
                 raf.write(moov);
-                // mdat header
                 long mdatSize = 8 + totalMedia;
                 raf.write(new byte[]{(byte)((mdatSize>>>24)&0xFF),(byte)((mdatSize>>>16)&0xFF),
                         (byte)((mdatSize>>>8)&0xFF),(byte)(mdatSize&0xFF), 'm','d','a','t'});
-                for (int i = 0; i < num; i++) raf.write(sampleData[i]);
+
+                for (int p = 0; p < num; p++) {
+                    int from = picFirst[p];
+                    int to = (p + 1 < num) ? picFirst[p + 1] : nVcl;
+                    for (int k = from; k < to; k++) {
+                        int len = vclLen[k];
+                        raf.write(new byte[]{(byte)((len>>>24)&0xFF),(byte)((len>>>16)&0xFF),
+                                (byte)((len>>>8)&0xFF),(byte)(len&0xFF)});
+                        long srcOff = vclOff[k];
+                        int remaining = len;
+                        while (remaining > 0) {
+                            int chunk = Math.min(stage.length, remaining);
+                            in.seek(srcOff);
+                            in.readFully(stage, 0, chunk);
+                            raf.write(stage, 0, chunk);
+                            srcOff += chunk; remaining -= chunk;
+                        }
+                    }
+                    if (cb != null && (p & 0xFF) == 0)
+                        cb.onProgress((int) Math.min(99, (p * 100L) / num));
+                }
             } finally {
                 raf.close();
             }
@@ -250,6 +294,9 @@ public final class HevcTranscoder {
         }
     }
 
+    private static long[] growL(long[] a) { long[] r = new long[a.length * 2]; System.arraycopy(a, 0, r, 0, a.length); return r; }
+    private static int[]  growI(int[] a)  { int[]  r = new int[a.length * 2];  System.arraycopy(a, 0, r, 0, a.length); return r; }
+
     // ------------------------------------------------------------------ moov
 
     private static byte[] buildMoov(int w, int h, int num, int[] sampleSize,
@@ -257,20 +304,18 @@ public final class HevcTranscoder {
                                     int[] sync, int nSync, List<int[]> stscEntries) throws IOException {
         long duration = (long) num * SAMPLE_DELTA;
 
-        // mvhd
         ByteArrayOutputStream mvhd = new ByteArrayOutputStream();
-        mvhd.write(new byte[4]);                 // version(0) + flags
-        mvhd.write(new byte[4]);                 // creation_time
-        mvhd.write(new byte[4]);                 // modification_time
+        mvhd.write(new byte[4]);
+        mvhd.write(new byte[4]);
+        mvhd.write(new byte[4]);
         wrI(mvhd, TIMESCALE); wrI(mvhd, (int) duration);
-        wrI(mvhd, 0x00010000);                  // rate
-        mvhd.write(new byte[]{0x01,0,0,0});     // volume(0x0100) + reserved(2)
-        mvhd.write(new byte[8]);                // reserved 2 x u32
+        wrI(mvhd, 0x00010000);
+        mvhd.write(new byte[]{0x01,0,0,0});
+        mvhd.write(new byte[8]);
         writeMatrix(mvhd);
         mvhd.write(new byte[24]);
         wrI(mvhd, 2);
 
-        // tkhd
         ByteArrayOutputStream tkhd = new ByteArrayOutputStream();
         wrI(tkhd, 0x00000007);
         tkhd.write(new byte[4]); tkhd.write(new byte[4]);
@@ -282,22 +327,19 @@ public final class HevcTranscoder {
         writeMatrix(tkhd);
         wrI(tkhd, w << 16); wrI(tkhd, h << 16);
 
-        // mdhd
         ByteArrayOutputStream mdhd = new ByteArrayOutputStream();
-        mdhd.write(new byte[4]);                 // version(0) + flags
-        mdhd.write(new byte[4]);                 // creation_time
-        mdhd.write(new byte[4]);                 // modification_time
+        mdhd.write(new byte[4]);
+        mdhd.write(new byte[4]);
+        mdhd.write(new byte[4]);
         wrI(mdhd, TIMESCALE); wrI(mdhd, (int) duration);
         mdhd.write(new byte[]{0x55,(byte)0xC4,0,0});
 
-        // hdlr
         ByteArrayOutputStream hdlr = new ByteArrayOutputStream();
         hdlr.write(new byte[4]); hdlr.write(new byte[4]);
         hdlr.write(new byte[]{'v','i','d','e'});
         hdlr.write(new byte[12]);
         hdlr.write("VideoHandler".getBytes("US-ASCII")); hdlr.write(0);
 
-        // stsd -> hev1 -> hvcC
         ByteArrayOutputStream hev1 = new ByteArrayOutputStream();
         hev1.write(new byte[6]);
         hev1.write(new byte[]{0,1});
@@ -314,26 +356,21 @@ public final class HevcTranscoder {
         ByteArrayOutputStream stsd = new ByteArrayOutputStream();
         stsd.write(new byte[4]); wrI(stsd, 1); stsd.write(box("hev1", hev1.toByteArray()));
 
-        // stts
         ByteArrayOutputStream stts = new ByteArrayOutputStream();
         stts.write(new byte[4]); wrI(stts, 1); wrI(stts, num); wrI(stts, SAMPLE_DELTA);
 
-        // stss (sync samples)
         ByteArrayOutputStream stss = new ByteArrayOutputStream();
         stss.write(new byte[4]); wrI(stss, nSync);
         for (int i = 0; i < nSync; i++) wrI(stss, sync[i]);
 
-        // stsc: chunk mapping (merged entries)
         ByteArrayOutputStream stsc = new ByteArrayOutputStream();
         stsc.write(new byte[4]); wrI(stsc, stscEntries.size());
         for (int[] e : stscEntries) { wrI(stsc, e[0]); wrI(stsc, e[1]); wrI(stsc, 1); }
 
-        // stsz
         ByteArrayOutputStream stsz = new ByteArrayOutputStream();
         stsz.write(new byte[4]); wrI(stsz, 0); wrI(stsz, num);
         for (int i = 0; i < num; i++) wrI(stsz, sampleSize[i]);
 
-        // stco
         ByteArrayOutputStream stco = new ByteArrayOutputStream();
         stco.write(new byte[4]); wrI(stco, chunkOffsets.length);
         for (int i = 0; i < chunkOffsets.length; i++) wrI(stco, chunkOffsets[i]);
@@ -346,11 +383,9 @@ public final class HevcTranscoder {
         stbl.write(box("stsz", stsz.toByteArray()));
         stbl.write(box("stco", stco.toByteArray()));
 
-        // vmhd  (version 0, flags 1)
         ByteArrayOutputStream vmhd = new ByteArrayOutputStream();
         wrI(vmhd, 1); vmhd.write(new byte[8]);
 
-        // dinf/dref/url
         ByteArrayOutputStream url = new ByteArrayOutputStream();
         wrI(url, 1);
         ByteArrayOutputStream dref = new ByteArrayOutputStream();
@@ -393,14 +428,14 @@ public final class HevcTranscoder {
         o.write(profileIdc);
         o.write(0); o.write(0); o.write(0); o.write(0x60);
         o.write(0); o.write(0); o.write(0); o.write(0); o.write(0); o.write(0);
-        o.write(0x5A);                              // general_level_idc
+        o.write(0x5A);
         o.write(0xF0); o.write(0x00);
         o.write(0xFC);
         o.write(0xFC | 1);
         o.write(0xF8);
         o.write(0xF8);
         o.write(0); o.write(0);
-        o.write(0x0F);                              // lengthSizeMinusOne = 3
+        o.write(0x0F);
         o.write(3);
         writeArray(o, 32, vps);
         writeArray(o, 33, sps);
@@ -410,8 +445,8 @@ public final class HevcTranscoder {
 
     private static void writeArray(ByteArrayOutputStream o, int nalType, byte[] nal) {
         o.write(0x80 | (nalType & 0x3F));
-        o.write(0); o.write(1);                      // numNalus = 1 (big-endian u16)
-        o.write((nal.length >> 8) & 0xFF); o.write(nal.length & 0xFF); // nalUnitLength
+        o.write(0); o.write(1);
+        o.write((nal.length >> 8) & 0xFF); o.write(nal.length & 0xFF);
         o.write(nal, 0, nal.length);
     }
 
