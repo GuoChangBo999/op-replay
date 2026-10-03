@@ -651,12 +651,17 @@ class MainActivity : AppCompatActivity() {
         try {
             // Pure-Java remux (no re-encode): raw Annex-B HEVC -> mp4 container.
             val ok = HevcTranscoder.transcode(src, out) { p -> onProgress?.invoke(p) }
-            // DEBUG: copy the produced mp4 to a public path so we can inspect it.
+            // DEBUG: copy the produced mp4 AND the transcode log to a public path so we can inspect.
             try {
                 val dbg = File("/sdcard/Download", "debug_" + out.name)
                 if (out.exists()) out.copyTo(dbg, overwrite = true)
+                val lg = File(cacheDir, "tc.log")
+                if (lg.exists()) lg.copyTo(File("/sdcard/Download", "debug_tc.log"), overwrite = true)
             } catch (_: Exception) {}
-            return if (ok && out.length() > 0) out else src
+            // A valid mp4 from ~1200 HEVC frames is many MB; a few hundred bytes means
+            // MediaMuxer wrote an empty 'stbl' and the video would be black. Treat that
+            // as failure so we don't hand a broken file to VideoView.
+            return if (ok && out.length() > 1024) out else src
         } catch (e: Exception) {
             lastTranscodeError = "${e.javaClass.simpleName}: ${e.message}"
             return src
