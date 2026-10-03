@@ -54,6 +54,7 @@ public final class HevcTranscoder {
         RandomAccessFile in = new RandomAccessFile(src, "r");
         try {
             final long fileLen = in.length();
+            android.util.Log.i("HevcTranscoder", "transcode start: " + src + " size=" + fileLen + " -> " + out);
 
             // ---- 1. scan for NAL start codes (00 00 01 / 00 00 00 01) ----
             List<long[]> nals = new ArrayList<>();   // {startCodeOffset, startCodeLen}
@@ -76,6 +77,7 @@ public final class HevcTranscoder {
                 scanPos += bufLen;
             }
             if (nals.isEmpty()) throw new IOException("no NAL start codes (not Annex-B HEVC?)");
+            android.util.Log.i("HevcTranscoder", "nal start codes=" + nals.size());
 
             // ---- 2. split into csd (VPS+SPS+PPS) + one sample per PICTURE ----
             ByteArrayOutputStream csdW = new ByteArrayOutputStream();
@@ -132,6 +134,8 @@ public final class HevcTranscoder {
             if (samples.isEmpty()) throw new IOException("no VCL NAL units found");
             if (csdW.size() == 0) throw new IOException("no VPS/SPS/PPS found");
             if (w == 0 || h == 0) { w = 1928; h = 1208; }  // openpilot 3-cam default
+            android.util.Log.i("HevcTranscoder", "pictures=" + samples.size()
+                    + " csdBytes=" + csdW.size() + " size=" + w + "x" + h);
 
             // ---- 3. write MP4 (zero re-encode) ----
             if (out.exists()) out.delete();
@@ -145,6 +149,7 @@ public final class HevcTranscoder {
             fmt.setByteBuffer("csd-0", ByteBuffer.wrap(csdW.toByteArray()));
             int track = muxer.addTrack(fmt);
             muxer.start();
+            android.util.Log.i("HevcTranscoder", "muxer started, track=" + track + " fps=" + DEFAULT_FPS);
 
             ByteBuffer sampleBuf = ByteBuffer.allocate(4 * 1024 * 1024).order(ByteOrder.BIG_ENDIAN);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -189,6 +194,8 @@ public final class HevcTranscoder {
 
             try { muxer.stop(); } finally { muxer.release(); }
             if (cb != null) cb.onProgress(100);
+            android.util.Log.i("HevcTranscoder", "done: wrote " + samples.size()
+                    + " samples, out size=" + out.length());
             return out.length() > 0;
         } finally {
             try { in.close(); } catch (IOException ignored) {}

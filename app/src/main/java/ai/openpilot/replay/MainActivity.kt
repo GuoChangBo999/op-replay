@@ -649,8 +649,13 @@ class MainActivity : AppCompatActivity() {
         val out = File(cacheDir, name)
         if (out.exists()) out.delete()
         try {
-            // Pure-Java ByteBuffer transcode (no EGL): HEVC decode -> YUV copy -> H.264 encode.
+            // Pure-Java remux (no re-encode): raw Annex-B HEVC -> mp4 container.
             val ok = HevcTranscoder.transcode(src, out) { p -> onProgress?.invoke(p) }
+            // DEBUG: copy the produced mp4 to a public path so we can inspect it.
+            try {
+                val dbg = File("/sdcard/Download", "debug_" + out.name)
+                if (out.exists()) out.copyTo(dbg, overwrite = true)
+            } catch (_: Exception) {}
             return if (ok && out.length() > 0) out else src
         } catch (e: Exception) {
             lastTranscodeError = "${e.javaClass.simpleName}: ${e.message}"
