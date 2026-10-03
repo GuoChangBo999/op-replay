@@ -12,6 +12,7 @@ import com.chaquo.python.android.AndroidPlatform
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.regex.Pattern
@@ -471,9 +472,15 @@ class MainActivity : AppCompatActivity() {
         status.text = "处理中:复制视频…"
         Thread {
             try {
-                // 复制原始 HEVC 裸流到 cache
-                val vfRaw = copyToCache(vUri, "front.hevc")
-                val efRaw = wideUri?.let { copyToCache(it, "wide.hevc") }
+                // 复制选中文件到 cache
+                val vCopied = copyToCache(vUri, "picked_video")
+                val eCopied = wideUri?.let { copyToCache(it, "picked_wide") }
+                // 如果是 zip（comma3 行车记录下载），先抽出里面的 *camera.hevc 裸流再转码
+                runOnUiThread { status.text = if (isZip(vCopied)) "处理中:从 zip 提取摄像头流…" else "处理中:读取视频…" }
+                val vfRaw = extractVideoFromZipIfNeeded(vCopied) { p ->
+                    runOnUiThread { status.text = "从 zip 提取… $p%" }
+                }
+                val efRaw = eCopied?.let { extractVideoFromZipIfNeeded(it) }
 
                 // HEVC 系统播放器/旧 WebView 都播不了，转成 H.264 mp4（纯 Java，ByteBuffer 通路，无 EGL）
                 runOnUiThread { status.text = "处理中:转码前摄(HEVC→H.264)…" }
@@ -624,6 +631,130 @@ class MainActivity : AppCompatActivity() {
         }
         return f
     }
+
+    // =====================================================================
+    //  zip support: comma3 "行车记录查看下载" gives ONE .zip containing all
+    //  cameras (ecamera/fcamera/qcamera hevc/ts + qlog/rlog.zst). We must pull
+    //  the raw *camera.hevc out of it before transcoding, otherwise the zip
+    //  bytes get treated as HEVC and the NAL scan finds nothing -> crash.
+    // =====================================================================
+
+    /** true if [f] starts with the local-file-header magic "PK\x03\x04". */
+    private fun isZip(f: File): Boolean = try {
+        FileInputStream(f).use { ins ->
+            val b = ByteArray(4); val n = ins.read(b)
+            n == 4 && b[0] == 0x50.toByte() && b[1] == 0x4B.toByte() &&
+                b[2] == 0x03.toByte() && b[3] == 0x04.toByte()
+        }
+    } catch (_: Exception) { false }
+
+    /**
+     * If [src] is a ZIP, stream the best *camera.hevc member out of it into cache and
+     * return that extracted file; otherwise return [src] unchanged.
+     *
+     * The comma3 routes are stored (method=0, no compression) so we can copy the member
+     * straight out by its local-header data offset with random access — no unzip needed
+     * for 800MB+ archives. A generic ZipInputStream fallback handles compressed zips.
+     */
+    private fun extractVideoFromZipIfNeeded(src: File, onProgress: ((Int) -> Unit)? = null): File {
+        if (!isZip(src)) return src
+        // pick the member we want: prefer fcamera.hevc, else ecamera.hevc, else any *.hevc / *.mp4 / *.ts
+        val want = { n: String ->
+            when {
+                n.endsWith("fcamera.hevc", true) -> 0
+                n.endsWith("ecamera.hevc", true) -> 1
+                n.endsWith(".hevc", true) -> 2
+                n.endsWith(".mp4", true) -> 3
+                n.endsWith(".ts", true) -> 4
+                else -> 99
+            }
+        }
+        RandomAccessFile(src, "r").use { raf ->
+            val len = raf.length()
+            // 1) locate End-of-Central-Directory (scan last 64KB for PK)
+            val tailLen = minOf(len, 65536L + 22).toInt()
+            val tail = ByteArray(tailLen)
+            raf.seek(len - tailLen)
+            raf.readFully(tail)
+            var eocd = -1
+            var i = tailLen - 22
+            while (i >= 0) {
+                if (tail[i] == 0x50.toByte() && tail[i + 1] == 0x4B.toByte() &&
+                    tail[i + 2] == 0x05.toByte() && tail[i + 3] == 0x06.toByte()) { eocd = i; break }
+                i--
+            }
+            if (eocd < 0) throw java.io.IOException("zip: EOCD not found")
+            val cdCount = u16(tail, eocd + 10)
+            val cdSize = u32(tail, eocd + 12)
+            val cdOff = u32(tail, eocd + 16).toLong()
+            // 2) read central directory
+            val cd = ByteArray(cdSize.toInt())
+            raf.seek(cdOff)
+            raf.readFully(cd)
+            var p = 0
+            var bestName: String? = null
+            var bestCsize = 0L; var bestUsize = 0L; var bestMethod = 0; var bestLho = 0L; var bestRank = 99
+            for (k in 0 until cdCount) {
+                if (p + 46 > cd.size) break
+                if (!(cd[p] == 0x50.toByte() && cd[p + 1] == 0x4B.toByte() &&
+                        cd[p + 2] == 0x01.toByte() && cd[p + 3] == 0x02.toByte())) break
+                val method = u16(cd, p + 10)
+                val csize = u32(cd, p + 20).toLong()
+                val usize = u32(cd, p + 24).toLong()
+                val nlen = u16(cd, p + 28)
+                val elen = u16(cd, p + 30)
+                val clen = u16(cd, p + 32)
+                val lho = u32(cd, p + 42).toLong()
+                val name = String(cd, p + 46, nlen, Charsets.UTF_8)
+                val r = want(name)
+                if (r < bestRank) { bestRank = r; bestName = name; bestCsize = csize; bestUsize = usize; bestMethod = method; bestLho = lho }
+                p += 46 + nlen + elen + clen
+            }
+            if (bestName == null) throw java.io.IOException("zip: no camera stream inside")
+            val outName = if (bestName!!.contains("wide", true) || bestName!!.contains("ecamera", true)) "wide.hevc" else "front.hevc"
+            val out = File(cacheDir, outName)
+            if (out.exists()) out.delete()
+            FileOutputStream(out).use { o ->
+                if (bestMethod == 0) {
+                    // stored: read local header to learn name/extra lengths, then copy raw bytes
+                    raf.seek(bestLho)
+                    val lh = ByteArray(30)
+                    raf.readFully(lh)
+                    val nlen = u16(lh, 26); val elen = u16(lh, 28)
+                    val dataOff = bestLho + 30 + nlen + elen
+                    raf.seek(dataOff)
+                    val total = if (bestUsize > 0) bestUsize else bestCsize
+                    val buf = ByteArray(1 shl 20)
+                    var remaining = total
+                    while (remaining > 0) {
+                        val wantRead = minOf(buf.size.toLong(), remaining).toInt()
+                        val got = raf.read(buf, 0, wantRead)
+                        if (got <= 0) break
+                        o.write(buf, 0, got)
+                        remaining -= got
+                        onProgress?.invoke((((total - remaining) * 100 / total)).toInt())
+                    }
+                } else {
+                    // compressed fallback: full ZipInputStream pass
+                    java.util.zip.ZipInputStream(FileInputStream(src)).use { zis ->
+                        var e = zis.nextEntry
+                        while (e != null) {
+                            if (e.name == bestName) { zis.copyTo(o); break }
+                            e = zis.nextEntry
+                        }
+                    }
+                }
+            }
+            if (out.length() < 1024) throw java.io.IOException("zip: extracted ${out.length()} bytes (too small)")
+            return out
+        }
+    }
+
+    private fun u16(b: ByteArray, off: Int): Int =
+        (b[off].toInt() and 0xFF) or ((b[off + 1].toInt() and 0xFF) shl 8)
+    private fun u32(b: ByteArray, off: Int): Long =
+        ((b[off].toLong() and 0xFFL)) or ((b[off + 1].toLong() and 0xFFL) shl 8) or
+        ((b[off + 2].toLong() and 0xFFL) shl 16) or ((b[off + 3].toLong() and 0xFFL) shl 24)
 
     /**
      * Make [src] playable by the native VideoView.
