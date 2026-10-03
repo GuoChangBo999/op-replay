@@ -83,7 +83,9 @@ public final class HevcTranscoder {
             // ---- 2. split into VPS/SPS/PPS + one sample per PICTURE ----
             byte[] vps = null, sps = null, pps = null;
             List<List<long[]>> samples = new ArrayList<>();
+            List<Integer> picTypes = new ArrayList<>();   // first-slice nal_type per picture
             List<long[]> curSlices = new ArrayList<>();
+            int curType = -1;
             int N = nals.size();
 
             for (int k = 0; k < N; k++) {
@@ -115,12 +117,14 @@ public final class HevcTranscoder {
                     long trimmed = trimTrailingZeros(in, dataOff, nalLen);
                     if (firstSlice && !curSlices.isEmpty()) {
                         samples.add(curSlices);
+                        picTypes.add(curType);
                         curSlices = new ArrayList<>();
                     }
+                    if (firstSlice) curType = nalType;
                     curSlices.add(new long[]{dataOff, trimmed});
                 }
             }
-            if (!curSlices.isEmpty()) samples.add(curSlices);
+            if (!curSlices.isEmpty()) { samples.add(curSlices); picTypes.add(curType); }
 
             if (samples.isEmpty()) throw new IOException("no VCL NAL units");
             if (vps == null || sps == null || pps == null) throw new IOException("missing VPS/SPS/PPS");
@@ -173,14 +177,50 @@ public final class HevcTranscoder {
                     new byte[]{'i','s','o','m'},
                     new byte[]{'m','p','4','2'}));
 
+            // sync samples (IDR/IRAP pictures, 1-based) for stss
+            int[] sync = new int[num];
+            int nSync = 0;
+            for (int i = 0; i < num; i++) {
+                int t = picTypes.get(i);
+                if (t >= 16 && t <= 21) sync[nSync++] = i + 1;
+            }
+            log("sync samples=" + nSync);
+
+            // chunk division like ffmpeg: ~1MB per chunk
+            final int CHUNK_TARGET = 1_000_000;
+            List<int[]> chunks = new ArrayList<>();  // {firstSample, count}
+            {
+                int i = 0;
+                while (i < num) {
+                    int acc = 0, start = i;
+                    while (i < num && (acc < CHUNK_TARGET || i == start)) {
+                        acc += sampleSize[i]; i++;
+                    }
+                    chunks.add(new int[]{start, i - start});
+                }
+            }
+            int nChunks = chunks.size();
+            // stsc entries: merge consecutive equal counts
+            List<int[]> stscEntries = new ArrayList<>(); // {firstChunk(1-based), samplesPerChunk}
+            for (int ci = 0; ci < nChunks; ci++) {
+                int cnt = chunks.get(ci)[1];
+                if (!stscEntries.isEmpty() && stscEntries.get(stscEntries.size() - 1)[1] == cnt) continue;
+                stscEntries.add(new int[]{ci + 1, cnt});
+            }
+            log("chunks=" + nChunks + " stsc entries=" + stscEntries.size());
+
             // build moov with a dummy stco to get its (fixed) size
             byte[] moovDummy = buildMoov(w, h, num, sampleSize, hvcc,
-                    new int[num]); // zero offsets
+                    new int[nChunks], sync, nSync, stscEntries);
             long offsetBase = ftyp.length + moovDummy.length + 8; // +8 for mdat header
-            int[] offsets = new int[num];
+            // sample offsets
+            int[] sampleOff = new int[num];
             long pos = offsetBase;
-            for (int i = 0; i < num; i++) { offsets[i] = (int) pos; pos += sampleSize[i]; }
-            byte[] moov = buildMoov(w, h, num, sampleSize, hvcc, offsets);
+            for (int i = 0; i < num; i++) { sampleOff[i] = (int) pos; pos += sampleSize[i]; }
+            // chunk offsets = first sample offset of each chunk
+            int[] chunkOff = new int[nChunks];
+            for (int i = 0; i < nChunks; i++) chunkOff[i] = sampleOff[chunks.get(i)[0]];
+            byte[] moov = buildMoov(w, h, num, sampleSize, hvcc, chunkOff, sync, nSync, stscEntries);
             if (moov.length != moovDummy.length)
                 throw new IOException("moov size changed: " + moov.length + " vs " + moovDummy.length);
 
@@ -213,7 +253,8 @@ public final class HevcTranscoder {
     // ------------------------------------------------------------------ moov
 
     private static byte[] buildMoov(int w, int h, int num, int[] sampleSize,
-                                    byte[] hvcc, int[] offsets) throws IOException {
+                                    byte[] hvcc, int[] chunkOffsets,
+                                    int[] sync, int nSync, List<int[]> stscEntries) throws IOException {
         long duration = (long) num * SAMPLE_DELTA;
 
         // mvhd
@@ -277,9 +318,15 @@ public final class HevcTranscoder {
         ByteArrayOutputStream stts = new ByteArrayOutputStream();
         stts.write(new byte[4]); wrI(stts, 1); wrI(stts, num); wrI(stts, SAMPLE_DELTA);
 
-        // stsc: 1 sample per chunk
+        // stss (sync samples)
+        ByteArrayOutputStream stss = new ByteArrayOutputStream();
+        stss.write(new byte[4]); wrI(stss, nSync);
+        for (int i = 0; i < nSync; i++) wrI(stss, sync[i]);
+
+        // stsc: chunk mapping (merged entries)
         ByteArrayOutputStream stsc = new ByteArrayOutputStream();
-        stsc.write(new byte[4]); wrI(stsc, 1); wrI(stsc, 1); wrI(stsc, 1); wrI(stsc, 1);
+        stsc.write(new byte[4]); wrI(stsc, stscEntries.size());
+        for (int[] e : stscEntries) { wrI(stsc, e[0]); wrI(stsc, e[1]); wrI(stsc, 1); }
 
         // stsz
         ByteArrayOutputStream stsz = new ByteArrayOutputStream();
@@ -288,12 +335,13 @@ public final class HevcTranscoder {
 
         // stco
         ByteArrayOutputStream stco = new ByteArrayOutputStream();
-        stco.write(new byte[4]); wrI(stco, num);
-        for (int i = 0; i < num; i++) wrI(stco, offsets[i]);
+        stco.write(new byte[4]); wrI(stco, chunkOffsets.length);
+        for (int i = 0; i < chunkOffsets.length; i++) wrI(stco, chunkOffsets[i]);
 
         ByteArrayOutputStream stbl = new ByteArrayOutputStream();
         stbl.write(box("stsd", stsd.toByteArray()));
         stbl.write(box("stts", stts.toByteArray()));
+        stbl.write(box("stss", stss.toByteArray()));
         stbl.write(box("stsc", stsc.toByteArray()));
         stbl.write(box("stsz", stsz.toByteArray()));
         stbl.write(box("stco", stco.toByteArray()));
