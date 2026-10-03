@@ -1,9 +1,6 @@
 package ai.openpilot.replay
 
 import android.net.Uri
-import android.graphics.SurfaceTexture
-import android.opengl.GLES11Ext
-import android.opengl.GLES20
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.View
@@ -446,30 +443,33 @@ class MainActivity : AppCompatActivity() {
         status.text = "处理中:复制视频…"
         Thread {
             try {
-                // 方案A：VideoView 用系统 HEVC 硬解直接播原始裸流，无需转码。
-                // 扩展名必须带 .hevc 之类，VideoView 才能识别为视频；我们复制成 *.hevc。
+                // 复制原始 HEVC 裸流到 cache
                 val vfRaw = copyToCache(vUri, "front.hevc")
                 val efRaw = wideUri?.let { copyToCache(it, "wide.hevc") }
-                frontPath = vfRaw.absolutePath
-                widePath = efRaw?.absolutePath
+
+                // HEVC 无法在 WebView 里播，转成 H.264 mp4（纯 Java，ByteBuffer 通路，无 EGL）
+                runOnUiThread { status.text = "处理中:转码前摄(HEVC→H.264)…" }
+                val vf = ensurePlayable(vfRaw, "front.mp4") { p ->
+                    runOnUiThread { status.text = "转码前摄… $p%" }
+                }
+                val ef = efRaw?.let {
+                    ensurePlayable(it, "wide.mp4") { p -> runOnUiThread { status.text = "转码广角… $p%" } }
+                }
 
                 runOnUiThread { status.text = "处理中:解析日志…" }
                 val lf = copyToCache(lUri, "qlog.zst")
                 val mod = Python.getInstance().getModule("op_parser")
                 val json = mod.callAttr("parse_route", lf.absolutePath, "").toString()
                 runOnUiThread { status.text = "处理中:生成播放页…" }
-                val html = buildHtml(json, vfRaw, efRaw)
+                val html = buildHtml(json, vf, ef)
                 runOnUiThread {
-                    // WebView 只显示图表；视频由上面的 VideoView 播
-                    web.loadDataWithBaseURL("file://${vfRaw.parentFile!!.absolutePath}/", html, "text/html", "utf-8", null)
+                    // WebView 内嵌播放转好的 mp4 + 图表同屏联动
+                    web.loadDataWithBaseURL("file://${vf.parentFile!!.absolutePath}/", html, "text/html", "utf-8", null)
                     val m = Regex("\"samples\":\\s*(\\d+)").find(json)
                     status.text = "就绪(${m?.groupValues?.get(1) ?: "?"} 采样点)"
-
-                    // 摄像头切换按钮：有广角才显示
-                    camRow.visibility = if (efRaw != null) View.VISIBLE else View.GONE
-                    curCam = "front"
-                    // 启动原生播放
-                    playCam("front")
+                    // 隐藏原生 VideoView（改用 WebView 内嵌播放）
+                    video.visibility = View.GONE
+                    camRow.visibility = View.GONE
                     btnPlay.isEnabled = true
                 }
             } catch (e: Exception) {
@@ -562,7 +562,9 @@ class MainActivity : AppCompatActivity() {
         val out = File(cacheDir, name)
         if (out.exists()) out.delete()
         try {
-            return transcodeHevcToAvc(src, out, onProgress)
+            // Pure-Java ByteBuffer transcode (no EGL): HEVC decode -> YUV copy -> H.264 encode.
+            val ok = HevcTranscoder.transcode(src, out) { p -> onProgress?.invoke(p) }
+            return if (ok && out.length() > 0) out else src
         } catch (e: Exception) {
             lastTranscodeError = "${e.javaClass.simpleName}: ${e.message}"
             return src
@@ -576,121 +578,14 @@ class MainActivity : AppCompatActivity() {
         }
     } catch (e: Exception) { "ERR:${e.message}" }
 
-    /**
-     * Hardware transcode: MediaCodec(HEVC decoder) -> MediaCodec(AVC/H.264 encoder) -> MediaMuxer.
-     * Synchronous loop (dequeueInput/OutputBuffer with a short timeout); fine for a one-shot job
-     * on a background thread.
-     */
-    private fun transcodeHevcToAvc(src: File, out: File, onProgress: ((Int) -> Unit)?): File {
-        val extractor = android.media.MediaExtractor().apply { setDataSource(src.absolutePath) }
-        if (extractor.trackCount == 0) { extractor.release(); return src }
-
-        // pick the video track
-        var vTrack = -1
-        var inFmt: android.media.MediaFormat? = null
-        for (i in 0 until extractor.trackCount) {
-            val f = extractor.getTrackFormat(i)
-            val mime = f.getString(android.media.MediaFormat.KEY_MIME) ?: continue
-            if (mime.startsWith("video/")) { vTrack = i; inFmt = f; break }
-        }
-        if (vTrack < 0 || inFmt == null) { extractor.release(); return src }
-        extractor.selectTrack(vTrack)
-
-        val width = inFmt.getInteger(android.media.MediaFormat.KEY_WIDTH)
-        val height = inFmt.getInteger(android.media.MediaFormat.KEY_HEIGHT)
-        val fps = if (inFmt.containsKey(android.media.MediaFormat.KEY_FRAME_RATE))
-            inFmt.getInteger(android.media.MediaFormat.KEY_FRAME_RATE) else 20
-
-        // H.264 encoder at a sane bitrate. 1928x1208 -> ~6 Mbps keeps it watchable & small.
-        val outFmt = android.media.MediaFormat.createVideoFormat("video/avc", width, height).apply {
-            setInteger(android.media.MediaFormat.KEY_BIT_RATE, 6_000_000)
-            setInteger(android.media.MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT,
-                android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-        }
-        val enc = android.media.MediaCodec.createEncoderByType("video/avc")
-        enc.configure(outFmt, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE)
-        val inputSurface = enc.createInputSurface()
-        enc.start()
-
-        // EGL bridge: decoder -> SurfaceTexture -> encoder input Surface
-        val egl = EglRenderer(inputSurface, width, height)
-        val dec = android.media.MediaCodec.createDecoderByType(inFmt.getString(android.media.MediaFormat.KEY_MIME)!!)
-        dec.configure(inFmt, egl.decoderSurface, null, 0)
-        dec.start()
-
-        val muxer = android.media.MediaMuxer(out.absolutePath, android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var outTrack = -1
-        var muxStarted = false
-
-        val bufInfo = android.media.MediaCodec.BufferInfo()
-        var inputDone = false
-        var outputDone = false
-        var frame = 0
-        val totalUs = if (inFmt.containsKey(android.media.MediaFormat.KEY_DURATION))
-            inFmt.getLong(android.media.MediaFormat.KEY_DURATION) else 0L
-
-        while (!outputDone) {
-            // ---- feed decoder
-            if (!inputDone) {
-                val inIdx = dec.dequeueInputBuffer(10_000)
-                if (inIdx >= 0) {
-                    val ib = dec.getInputBuffer(inIdx)!!
-                    val sz = extractor.readSampleData(ib, 0)
-                    if (sz < 0) {
-                        dec.queueInputBuffer(inIdx, 0, 0, 0, android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        inputDone = true
-                    } else {
-                        val pts = extractor.sampleTime
-                        dec.queueInputBuffer(inIdx, 0, sz, pts, 0)
-                        extractor.advance()
-                    }
-                }
-            }
-            // ---- drain decoder: release to the SurfaceTexture-backed surface
-            val dIdx = dec.dequeueOutputBuffer(bufInfo, 10_000)
-            if (dIdx >= 0) {
-                val eos = (bufInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                val render = bufInfo.size != 0 && !eos
-                dec.releaseOutputBuffer(dIdx, render)
-                if (render) {
-                    egl.awaitNewImage()
-                    egl.drawFrame()
-                    frame++
-                    if (totalUs > 0) onProgress?.invoke(((bufInfo.presentationTimeUs * 100) / totalUs).toInt())
-                }
-                if (eos) enc.signalEndOfInputStream()
-            }
-            // ---- drain encoder -> muxer
-            val eIdx = enc.dequeueOutputBuffer(bufInfo, 10_000)
-            if (eIdx == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                outTrack = muxer.addTrack(enc.outputFormat)
-                muxer.start(); muxStarted = true
-            } else if (eIdx >= 0) {
-                val eb = enc.getOutputBuffer(eIdx)!!
-                if ((bufInfo.flags and android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) bufInfo.size = 0
-                if (bufInfo.size > 0 && muxStarted) {
-                    eb.position(bufInfo.offset); eb.limit(bufInfo.offset + bufInfo.size)
-                    muxer.writeSampleData(outTrack, eb, bufInfo)
-                }
-                enc.releaseOutputBuffer(eIdx, false)
-                if ((bufInfo.flags and android.media.MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
-            }
-        }
-
-        try { if (muxStarted) muxer.stop() } catch (_: Exception) {}
-        muxer.release(); enc.release(); dec.release()
-        egl.release(); extractor.release()
-        return if (out.length() > 0) out else src
-    }
-
     private fun buildHtml(signalsJson: String, videoFile: File, wideFile: File? = null): String {
         val chartJs = assets.open("chart.umd.min.js").bufferedReader().readText()
         val tpl = assets.open("replay_template.html").bufferedReader().readText()
-        // 方案A：模板里已无视频引用，只需要注入图表库与信号数据。
+        val wideName = wideFile?.name ?: "__CAM_E__"
         return tpl.replace("__CHARTJS__", chartJs)
             .replace("__SERIES_JSON__", signalsJson)
+            .replace("__CAM_E__", wideName)
+            .replace("__VIDEO_FILE__", videoFile.name)
     }
 
     private fun displayName(uri: Uri): String {
@@ -782,190 +677,4 @@ object DevicePageParser {
     }
 }
 
-// =========================================================================
-//  Minimal EGL helper: renders decoded video frames onto a MediaCodec input
-//  Surface (the "Surface input" path used for hardware transcoding).
-//
-//  The decoder is configured to output to an external-OES SurfaceTexture; each
-//  frame is then drawn as a full-screen textured quad onto the encoder's input
-//  Surface. This is the standard Android "DecodeEditEncode" pattern, stripped
-//  to the minimum needed for an off-screen, single-threaded transcode.
-// =========================================================================
-
-private class EglRenderer(
-    private val encoderSurface: android.view.Surface,
-    private val texW: Int,
-    private val texH: Int = texW
-) {
-
-    private val display: android.opengl.EGLDisplay
-    private val context: android.opengl.EGLContext
-    private val surface: android.opengl.EGLSurface
-
-    val surfaceTexture: android.graphics.SurfaceTexture
-    val decoderSurface: android.view.Surface
-
-    private var program = 0
-    private var uTexMatrix = 0
-    private var aPos = 0
-    private var aTex = 0
-    private var extTexId = 0
-
-    private val texMatrix = FloatArray(16)
-    private val frameLock = Object()
-    @Volatile private var frameAvailable = false
-
-    init {
-        display = android.opengl.EGL14.eglGetDisplay(android.opengl.EGL14.EGL_DEFAULT_DISPLAY)
-        val ver = IntArray(2)
-        if (!android.opengl.EGL14.eglInitialize(display, ver, 0, ver, 1))
-            throw RuntimeException("eglInitialize failed")
-
-        val cfgAttrs = intArrayOf(
-            android.opengl.EGL14.EGL_RED_SIZE, 8,
-            android.opengl.EGL14.EGL_GREEN_SIZE, 8,
-            android.opengl.EGL14.EGL_BLUE_SIZE, 8,
-            android.opengl.EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGL14.EGL_OPENGL_ES2_BIT,
-            0x3142, 1,   // EGL_RECORDABLE_ANDROID
-            android.opengl.EGL14.EGL_NONE
-        )
-        val cfgs = arrayOfNulls<android.opengl.EGLConfig>(1); val n = IntArray(1)
-        if (!android.opengl.EGL14.eglChooseConfig(display, cfgAttrs, 0, cfgs, 0, 1, n, 0) || n[0] == 0)
-            throw RuntimeException("eglChooseConfig failed")
-        val ctxAttrs = intArrayOf(android.opengl.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, android.opengl.EGL14.EGL_NONE)
-        context = android.opengl.EGL14.eglCreateContext(display, cfgs[0], android.opengl.EGL14.EGL_NO_CONTEXT, ctxAttrs, 0)
-        val sAttrs = intArrayOf(android.opengl.EGL14.EGL_NONE)
-        surface = android.opengl.EGL14.eglCreateWindowSurface(display, cfgs[0], encoderSurface, sAttrs, 0)
-        checkEgl()
-        makeCurrent()
-
-        surfaceTexture = android.graphics.SurfaceTexture(0)
-        surfaceTexture.setDefaultBufferSize(texW, texH)
-        decoderSurface = android.view.Surface(surfaceTexture)
-
-        // create the external texture the SurfaceTexture will feed, and bind it to unit 0
-        val texIds = IntArray(1)
-        android.opengl.GLES20.glGenTextures(1, texIds, 0)
-        extTexId = texIds[0]
-        android.opengl.GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, extTexId)
-        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MIN_FILTER, android.opengl.GLES20.GL_LINEAR)
-        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_MAG_FILTER, android.opengl.GLES20.GL_LINEAR)
-        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_S, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
-        android.opengl.GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, android.opengl.GLES20.GL_TEXTURE_WRAP_T, android.opengl.GLES20.GL_CLAMP_TO_EDGE)
-        surfaceTexture.attachToGLContext(extTexId)
-        surfaceTexture.setOnFrameAvailableListener {
-            synchronized(frameLock) { frameAvailable = true; frameLock.notifyAll() }
-        }
-
-        program = buildProgram()
-        uTexMatrix = android.opengl.GLES20.glGetUniformLocation(program, "uTexMatrix")
-        aPos = android.opengl.GLES20.glGetAttribLocation(program, "aPos")
-        aTex = android.opengl.GLES20.glGetAttribLocation(program, "aTex")
-    }
-
-    private fun checkEgl() {
-        val e = android.opengl.EGL14.eglGetError()
-        if (e != android.opengl.EGL14.EGL_SUCCESS) throw RuntimeException("EGL error 0x${Integer.toHexString(e)}")
-    }
-
-    private fun makeCurrent() {
-        if (!android.opengl.EGL14.eglMakeCurrent(display, surface, surface, context))
-            throw RuntimeException("eglMakeCurrent failed")
-    }
-
-    /** wait for a decoded frame to arrive, then pull it into the external texture. */
-    fun awaitNewImage() {
-        synchronized(frameLock) {
-            var waited = 0L
-            while (!frameAvailable && waited < 2000) {
-                try { frameLock.wait(50) } catch (_: InterruptedException) {}
-                waited += 50
-            }
-            frameAvailable = false
-        }
-        surfaceTexture.updateTexImage()
-        surfaceTexture.getTransformMatrix(texMatrix)
-    }
-
-    fun drawFrame() {
-        makeCurrent()
-        android.opengl.GLES20.glViewport(0, 0, texW, texH)
-        android.opengl.GLES20.glClearColor(0f, 0f, 0f, 1f)
-        android.opengl.GLES20.glClear(android.opengl.GLES20.GL_COLOR_BUFFER_BIT)
-        android.opengl.GLES20.glUseProgram(program)
-        android.opengl.GLES20.glActiveTexture(android.opengl.GLES20.GL_TEXTURE0)
-        android.opengl.GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, extTexId)
-        android.opengl.GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0)
-        drawQuad()
-        if (!android.opengl.EGL14.eglSwapBuffers(display, surface))
-            throw RuntimeException("eglSwapBuffers failed")
-    }
-
-    private fun drawQuad() {
-        val verts = java.nio.ByteBuffer.allocateDirect(QUAD_VERTS.size * 4)
-            .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().apply { put(QUAD_VERTS); position(0) }
-        val tex = java.nio.ByteBuffer.allocateDirect(QUAD_TEX.size * 4)
-            .order(java.nio.ByteOrder.nativeOrder()).asFloatBuffer().apply { put(QUAD_TEX); position(0) }
-        verts.position(0); tex.position(0)
-        android.opengl.GLES20.glEnableVertexAttribArray(aPos)
-        android.opengl.GLES20.glVertexAttribPointer(aPos, 2, android.opengl.GLES20.GL_FLOAT, false, 0, verts)
-        android.opengl.GLES20.glEnableVertexAttribArray(aTex)
-        android.opengl.GLES20.glVertexAttribPointer(aTex, 2, android.opengl.GLES20.GL_FLOAT, false, 0, tex)
-        android.opengl.GLES20.glDrawArrays(android.opengl.GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        android.opengl.GLES20.glDisableVertexAttribArray(aPos)
-        android.opengl.GLES20.glDisableVertexAttribArray(aTex)
-    }
-
-    private fun buildProgram(): Int {
-        val vs = """
-            attribute vec4 aPos;
-            attribute vec2 aTex;
-            uniform mat4 uTexMatrix;
-            varying vec2 vTex;
-            void main(){ gl_Position = aPos; vTex = (uTexMatrix * vec4(aTex,0.0,1.0)).xy; }
-        """.trimIndent()
-        val fs = """
-            #extension GL_OES_EGL_image_external : require
-            precision mediump float;
-            uniform samplerExternalOES sTex;
-            varying vec2 vTex;
-            void main(){ gl_FragColor = texture2D(sTex, vTex); }
-        """.trimIndent()
-        val v = compile(android.opengl.GLES20.GL_VERTEX_SHADER, vs)
-        val f = compile(android.opengl.GLES20.GL_FRAGMENT_SHADER, fs)
-        val p = android.opengl.GLES20.glCreateProgram()
-        android.opengl.GLES20.glAttachShader(p, v)
-        android.opengl.GLES20.glAttachShader(p, f)
-        android.opengl.GLES20.glBindAttribLocation(p, 0, "aPos")
-        android.opengl.GLES20.glBindAttribLocation(p, 1, "aTex")
-        android.opengl.GLES20.glLinkProgram(p)
-        android.opengl.GLES20.glUseProgram(p)
-        // texture unit 0 for the external texture sampler
-        val loc = android.opengl.GLES20.glGetUniformLocation(p, "sTex")
-        android.opengl.GLES20.glUniform1i(loc, 0)
-        return p
-    }
-
-    private fun compile(type: Int, src: String): Int {
-        val s = android.opengl.GLES20.glCreateShader(type)
-        android.opengl.GLES20.glShaderSource(s, src)
-        android.opengl.GLES20.glCompileShader(s)
-        val ok = IntArray(1)
-        android.opengl.GLES20.glGetShaderiv(s, android.opengl.GLES20.GL_COMPILE_STATUS, ok, 0)
-        if (ok[0] == 0) throw RuntimeException("shader compile: " + android.opengl.GLES20.glGetShaderInfoLog(s))
-        return s
-    }
-
-    fun release() {
-        try { surfaceTexture.release() } catch (_: Exception) {}
-        try { decoderSurface.release() } catch (_: Exception) {}
-        android.opengl.EGL14.eglDestroySurface(display, surface)
-        android.opengl.EGL14.eglDestroyContext(display, context)
-        android.opengl.EGL14.eglTerminate(display)
-    }
-
-    companion object {
-        private val QUAD_VERTS = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
-        private val QUAD_TEX = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
-    }
 }

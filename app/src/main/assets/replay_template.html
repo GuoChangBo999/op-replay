@@ -51,8 +51,14 @@ window.onerror=function(m,s,l,c,e){var d=document.getElementById('jserr');d.styl
 </script>
 <header id="hdr">openpilot Route Replay</header>
 <div class="wrap">
-  <!-- 视频由原生 VideoView 播放（顶部），本页只负责信号显示 -->
-  <div id="vidInfo" style="font-size:12px;color:#8e8e93;padding:2px 0" ></div>
+  <video id="vid" controls playsinline webkit-playsinline x5-playsinline x5-video-player-type="h5" x5-video-player-fullscreen="false" preload="metadata" src="__VIDEO_FILE__"></video>
+  <div id="vidErr" style="display:none;color:#ff6b6b;font-size:13px;padding:6px;background:#2a1414;border-radius:8px;margin-top:4px">
+    ⚠️ 视频无法在本页播放（WebView 可能不支持该编码）。请返回点「外部播放」用系统播放器打开。
+  </div>
+  <div class="cambar" id="cambar">
+    <button class="cam active" id="btnF">前摄长焦</button>
+    <button class="cam" id="btnE">广角</button>
+  </div>
   <div class="blinkbar">
     <div class="bigblink left" id="c_bl">
       <div class="arrow">◀</div><div class="lbl">左 转 向</div>
@@ -119,8 +125,34 @@ const chart = new Chart(document.getElementById('chart'), {
       y1:{position:'right',ticks:{color:'#ffd60a'},grid:{display:false}}}}
 });
 
-// ---- 信号视图：不再由本页播放视频，改成由原生 VideoView 驱动本页刷新 ----
-// App 调 window.opReplay.setTime(t) 同步；本页点图表调 window.OPJS.onSeek(t) 通知 App。
+const video = document.getElementById('vid');
+// camera sources (fcamera = front/tele, ecamera = wide). __CAM_E__ is injected when both exist.
+const CAM = { front: "__VIDEO_FILE__", wide: "__CAM_E__" };
+let CAMK = 'front';
+(function initCam(){
+  const btnF=document.getElementById('btnF'), btnE=document.getElementById('btnE');
+  const bar=document.getElementById('cambar');
+  if(!bar||!btnF||!btnE) return;
+  // A valid wide source must look like a real video (data:/http/file or *.mp4/hevc/ts).
+  // (We must NOT compare against a placeholder string here: the build step does a
+  //  blanket .replace() over the whole file, which would rewrite it too.)
+  const w = String(CAM.wide||'');
+  const okWide = /^(data:|https?:|file:)/.test(w) || /\.(mp4|hevc|ts|webm)$/i.test(w);
+  if(!okWide){
+    bar.style.display='none'; return;
+  }
+  function setCam(k){
+    CAMK=k;
+    const t=video.currentTime, playing=!video.paused;
+    video.src = CAM[k];
+    try{ video.currentTime = t; }catch(e){}
+    if(playing) video.play();
+    btnF.classList.toggle('active', k==='front');
+    btnE.classList.toggle('active', k==='wide');
+  }
+  btnF.onclick=()=>setCam('front');
+  btnE.onclick=()=>setCam('wide');
+})();
 const T=DATA.t, VE=DATA.vEgo, G=DATA.gas, B=DATA.brake, S=DATA.steer;
 const BL=DATA.leftBlinker||[], BR=DATA.rightBlinker||[];
 const GP=DATA.gasPressed||[], BP=DATA.brakePressed||[];
@@ -153,27 +185,22 @@ function paint(i){
   document.getElementById('c_br').classList.toggle('on', br>0);
   if(window._li!==i){ window._li=i; chart.data.datasets.forEach((d,k)=>{d.pointRadius=T.map((_,j)=>j===i?3:0);}); chart.update('none'); }
 }
-// ---- 由原生 VideoView 调用：把视频当前时间同步到信号视图 ----
-window.opReplay = {
-  setTime: function(t){ window._vt=(t||0); paintThrottled(nearest(window._vt+OFF)); },
-  setCam:  function(name){ var e=document.getElementById('vidInfo'); if(e) e.textContent = name ? ('当前:'+name) : ''; }
-};
-function paintThrottled(i){ _lastI=i; if(_pending) return; _pending=true; requestAnimationFrame(function(){_pending=false;paint(_lastI);}); }
-// 点图表 -> 通知 App 让 VideoView 跳到该时间点
-document.getElementById('chart').addEventListener('click',function(ev){
-  var pts=chart.getElementsAtEventForMode(ev,'index',{intersect:false},true);
-  if(pts.length){
-    var i=pts[0].index;
-    paint(i);
-    var sec=Math.max(0, T[i]-OFF);
-    if(window.OPJS && window.OPJS.onSeek) window.OPJS.onSeek(String(sec));
-  }
+let _pending=false, _lastI=0;
+function paintThrottled(i){ _lastI=i; if(_pending) return; _pending=true; requestAnimationFrame(()=>{_pending=false;paint(_lastI);}); }
+video.addEventListener('timeupdate',()=>paintThrottled(nearest(video.currentTime+OFF)));
+// warn when the WebView can't decode the stream (e.g. HEVC on some devices)
+function showVidErr(){
+  var e=document.getElementById('vidErr'); if(e) e.style.display='block';
+}
+video.addEventListener('error',showVidErr);
+video.addEventListener('stalled',function(){ if(video.error) showVidErr(); });
+setTimeout(function(){ if(video.readyState===0 && video.networkState===3) showVidErr(); },2500);
+document.getElementById('chart').addEventListener('click',ev=>{
+  const pts=chart.getElementsAtEventForMode(ev,'index',{intersect:false},true);
+  if(pts.length){const i=pts[0].index;video.currentTime=Math.max(0,T[i]-OFF);paint(i);}
 });
-// --- 时间对齐滑块（仅用于显示对齐，不再操作视频） ---
+// --- sync offset slider ---
 const offEl = document.getElementById('offset'), offV = document.getElementById('offv');
-offEl.addEventListener('input', function(){
-  OFF = parseFloat(offEl.value); offV.textContent = OFF.toFixed(1)+'s';
-  paint(nearest((window._vt||0)+OFF));
-});
+offEl.addEventListener('input', ()=>{ OFF = parseFloat(offEl.value); offV.textContent = OFF.toFixed(1)+'s'; paint(nearest(video.currentTime+OFF)); });
 paint(0);
 </script></body></html>
