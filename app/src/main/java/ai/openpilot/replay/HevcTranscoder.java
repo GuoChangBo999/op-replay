@@ -136,7 +136,15 @@ public final class HevcTranscoder {
             MediaFormat fmt = MediaFormat.createVideoFormat("video/hevc", w, h);
             fmt.setInteger(MediaFormat.KEY_FRAME_RATE, DEFAULT_FPS);
             fmt.setInteger("max-input-size", 4 * 1024 * 1024);
-            fmt.setByteBuffer("csd-0", ByteBuffer.wrap(csdW.toByteArray()));
+            // IMPORTANT: csd-0 must be a DIRECT ByteBuffer. With a heap (wrap) buffer,
+            // some Qualcomm/Android MediaMuxer builds fail to build the 'stsd' box and
+            // then silently DROP every writeSampleData() -> an empty 585-byte mp4 whose
+            // 'stbl' is empty. That was the black-screen root cause.
+            byte[] csd = csdW.toByteArray();
+            ByteBuffer csdBuf = ByteBuffer.allocateDirect(csd.length);
+            csdBuf.put(csd);
+            csdBuf.flip();
+            fmt.setByteBuffer("csd-0", csdBuf);
 
             int track;
             try {
@@ -193,11 +201,19 @@ public final class HevcTranscoder {
                 }
 
                 ptsUs += 1_000_000L / DEFAULT_FPS;
+                if ((i % 500) == 0) log("after " + i + ": out=" + out.length());
                 if (cb != null && (i & 0xFF) == 0)
                     cb.onProgress((int) Math.min(100, (i * 100L) / samples.size()));
             }
 
             log("loop done: written=" + written + " skipped=" + skipped);
+            // Sanity: a real clip is many MB. If MediaMuxer silently dropped everything
+            // (no stsd/stbl), the file stays tiny -> report it loudly instead of "success".
+            long sz = out.length();
+            if (written > 0 && sz < 100_000) {
+                log("WARNING: muxer wrote " + written + " samples but file is only " + sz + " bytes");
+                throw new IOException("muxer dropped all samples (file=" + sz + "B)");
+            }
             try {
                 muxer.stop();
                 log("muxer.stop ok");
