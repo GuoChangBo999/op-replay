@@ -4,7 +4,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.View
-import android.webkit.WebView
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -36,7 +35,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnLog: Button
     private lateinit var btnPlay: Button
     private lateinit var btnExt: Button
-    private lateinit var web: WebView
     private lateinit var video: android.widget.VideoView
     private lateinit var camRow: android.widget.LinearLayout
     private lateinit var btnCamF: Button
@@ -57,12 +55,34 @@ class MainActivity : AppCompatActivity() {
     private var currentDir = "/data/media/0/realdata"  // for SSH fallback (unused now)
     private var lastTranscodeError: String? = null
 
-    // ---- 方案A：原生 VideoView 播放 + WebView 图表
+    // ---- 纯原生播放 + 原生信号面板（无 WebView）
     private var frontPath: String? = null   // 已复制到 cache 的前摄文件绝对路径
     private var widePath: String? = null    // 已复制到 cache 的广角文件绝对路径
     private var curCam = "front"            // front | wide
     private var syncRunning = false
     private val syncHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    // ---- 原生信号面板控件
+    private lateinit var wheel: WheelView
+    private lateinit var chart: ChartView
+    private lateinit var cSpd: TextView
+    private lateinit var cGas: TextView
+    private lateinit var cBrk: TextView
+    private lateinit var cStr: TextView
+    private lateinit var cWheel: TextView
+    private lateinit var blLeft: TextView
+    private lateinit var blRight: TextView
+
+    // ---- 解析后的信号数组（喂给 ChartView / 同步逻辑）
+    private var sigT: DoubleArray = DoubleArray(0)
+    private var sigVEgo: DoubleArray = DoubleArray(0)
+    private var sigGas: DoubleArray = DoubleArray(0)
+    private var sigBrake: DoubleArray = DoubleArray(0)
+    private var sigSteer: DoubleArray = DoubleArray(0)
+    private var sigLeftBlink: DoubleArray = DoubleArray(0)
+    private var sigRightBlink: DoubleArray = DoubleArray(0)
+    private var sigGasPressed: DoubleArray = DoubleArray(0)
+    private var sigBrakePressed: DoubleArray = DoubleArray(0)
 
     // ---- local-file pickers
     // NOTE: we pick with "*/*" on purpose. HEVC raw streams (fcamera.hevc / ecamera.hevc)
@@ -178,7 +198,6 @@ class MainActivity : AppCompatActivity() {
         btnLog = findViewById(R.id.btnLog)
         btnPlay = findViewById(R.id.btnPlay)
         btnExt = findViewById(R.id.btnExt)
-        web = findViewById(R.id.web)
         video = findViewById(R.id.video)
         camRow = findViewById(R.id.camRow)
         btnCamF = findViewById(R.id.btnCamF)
@@ -190,23 +209,27 @@ class MainActivity : AppCompatActivity() {
         pageNav = findViewById(R.id.pageNav)
         tvPage = findViewById(R.id.tvPage)
 
-        web.settings.javaScriptEnabled = true
-        web.settings.allowFileAccess = true
-        web.settings.domStorageEnabled = true
-        // 模板点图表时回调原生 -> VideoView seek
-        web.addJavascriptInterface(object {
-            @android.webkit.JavascriptInterface
-            fun onSeek(sec: String) {
-                val t = sec.toDoubleOrNull() ?: return
-                runOnUiThread {
-                    try {
-                        video.seekTo((t * 1000).toInt())
-                        if (!video.isPlaying) video.start()
-                    } catch (_: Exception) {}
-                }
+        // ---- 原生信号面板
+        wheel = findViewById(R.id.wheel)
+        chart = findViewById(R.id.chart)
+        cSpd = findViewById(R.id.cSpd)
+        cGas = findViewById(R.id.cGas)
+        cBrk = findViewById(R.id.cBrk)
+        cStr = findViewById(R.id.cStr)
+        cWheel = findViewById(R.id.cWheel)
+        blLeft = findViewById(R.id.blLeft)
+        blRight = findViewById(R.id.blRight)
+
+        // 点曲线 -> VideoView seek（纯原生，无 JS 桥）
+        chart.setOnSeekListener { sec ->
+            runOnUiThread {
+                try {
+                    video.seekTo((sec * 1000).toInt())
+                    if (!video.isPlaying) video.start()
+                } catch (_: Exception) {}
             }
-        }, "OPJS")
-        // VideoView 播放时，定时把当前时间推给图表
+        }
+        // VideoView 播放时，定时把当前时间推给原生控件
         video.setOnPreparedListener { mp ->
             mp.isLooping = false
             video.seekTo(0)
@@ -259,7 +282,12 @@ class MainActivity : AppCompatActivity() {
                     val pvRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                     val btnOpen = Button(this).apply { text = "在浏览器中打开原页面" }
                     btnOpen.setOnClickListener {
-                        web.loadDataWithBaseURL("$base/", html, "text/html", "utf-8", null)
+                        try {
+                            startActivity(android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse("$base/")
+                            ))
+                        } catch (e: Exception) { toast("打不开浏览器: ${e.message}") }
                     }
                     pvRow.addView(btnOpen)
                     remoteList.addView(pvRow)
@@ -447,7 +475,7 @@ class MainActivity : AppCompatActivity() {
                 val vfRaw = copyToCache(vUri, "front.hevc")
                 val efRaw = wideUri?.let { copyToCache(it, "wide.hevc") }
 
-                // HEVC 无法在 WebView 里播，转成 H.264 mp4（纯 Java，ByteBuffer 通路，无 EGL）
+                // HEVC 系统播放器/旧 WebView 都播不了，转成 H.264 mp4（纯 Java，ByteBuffer 通路，无 EGL）
                 runOnUiThread { status.text = "处理中:转码前摄(HEVC→H.264)…" }
                 val vf = ensurePlayable(vfRaw, "front.mp4") { p ->
                     runOnUiThread { status.text = "转码前摄… $p%" }
@@ -460,17 +488,23 @@ class MainActivity : AppCompatActivity() {
                 val lf = copyToCache(lUri, "qlog.zst")
                 val mod = Python.getInstance().getModule("op_parser")
                 val json = mod.callAttr("parse_route", lf.absolutePath, "").toString()
-                runOnUiThread { status.text = "处理中:生成播放页…" }
-                val html = buildHtml(json, vf, ef)
+
+                runOnUiThread { status.text = "处理中:填充信号面板…" }
+                parseSignals(json)
                 runOnUiThread {
-                    // WebView 内嵌播放转好的 mp4 + 图表同屏联动
-                    web.loadDataWithBaseURL("file://${vf.parentFile!!.absolutePath}/", html, "text/html", "utf-8", null)
+                    // 把解析出的数组喂给原生曲线图
+                    chart.setData(sigT, sigVEgo, sigGas, sigBrake, sigSteer,
+                        sigLeftBlink, sigRightBlink, sigGasPressed, sigBrakePressed)
+                    // 记住文件路径，供切换摄像头使用
+                    frontPath = vf.absolutePath
+                    widePath = ef?.absolutePath
+                    // 显示摄像头切换行（有广角时才显示）
+                    camRow.visibility = if (ef != null) View.VISIBLE else View.GONE
                     val m = Regex("\"samples\":\\s*(\\d+)").find(json)
                     status.text = "就绪(${m?.groupValues?.get(1) ?: "?"} 采样点)"
-                    // 隐藏原生 VideoView（改用 WebView 内嵌播放）
-                    video.visibility = View.GONE
-                    camRow.visibility = View.GONE
+                    // 原生播放前摄（HEVC 已转 H.264 mp4，系统硬解）
                     btnPlay.isEnabled = true
+                    playCam("front")
                 }
             } catch (e: Exception) {
                 runOnUiThread { status.text = "失败:${e.message}"; btnPlay.isEnabled = true }
@@ -483,13 +517,13 @@ class MainActivity : AppCompatActivity() {
         val path = if (cam == "wide") widePath else frontPath
         if (path == null) return
         curCam = cam
+        video.visibility = View.VISIBLE
         try {
             video.setVideoPath(path)
             video.requestFocus()
         } catch (e: Exception) {
             status.text = "播放失败:${e.message}"
         }
-        web.evaluateJavascript("window.opReplay && window.opReplay.setCam('${if (cam=="wide") "广角" else "前摄长焦"}')", null)
         btnCamF?.let { it.alpha = if (cam == "front") 1f else 0.5f }
         btnCamE?.let { it.alpha = if (cam == "wide") 1f else 0.5f }
     }
@@ -498,17 +532,17 @@ class MainActivity : AppCompatActivity() {
     private fun switchCam(cam: String) {
         if (cam == curCam) return
         val t = try { video.currentPosition } catch (_: Exception) { 0 }
-        playCam(cam)
-        // 切换后恢复到同一时间点
+        // 一次性 prepared 回调：跳到同一时间点再继续同步
         video.setOnPreparedListener { mp ->
             mp.isLooping = false
             try { video.seekTo(t) } catch (_: Exception) {}
             video.start()
             startSync()
         }
+        playCam(cam)
     }
 
-    /** 每 ~100ms 把 VideoView 当前时间推给 WebView 图表 */
+    /** 每 ~100ms 把 VideoView 当前时间同步到所有原生控件 */
     private fun startSync() {
         if (syncRunning) return
         syncRunning = true
@@ -517,12 +551,65 @@ class MainActivity : AppCompatActivity() {
                 if (!syncRunning) return
                 try {
                     val t = video.currentPosition / 1000.0
-                    web.evaluateJavascript("window.opReplay && window.opReplay.setTime($t)", null)
+                    updateSignalsAt(t)
                 } catch (_: Exception) {}
                 syncHandler.postDelayed(this, 100)
             }
         }
         syncHandler.postDelayed(tick, 100)
+    }
+
+    /** 按时刻 t（秒）更新原生面板：数值 / 方向盘 / 转向灯 / 曲线竖线 */
+    private fun updateSignalsAt(t: Double) {
+        val i = nearestIndex(t)
+        if (i < 0) return
+        chart.setCurrentIndex(i)
+        val spd = sigVEgo[i] * 3.6
+        cSpd.text = String.format("%.0f", spd)
+        cGas.text = String.format("%.0f", sigGas[i] * 100.0)
+        cBrk.text = String.format("%.0f", sigBrake[i] * 100.0)
+        val deg = sigSteer[i]
+        cStr.text = String.format("%.0f", deg)
+        cWheel.text = String.format("%.0f°", deg)
+        wheel.setAngle(deg.toFloat())
+        // 转向灯高亮
+        blLeft.setTextColor(if (sigLeftBlink[i] > 0.5) 0xFFFFD60A.toInt() else 0xFF555555.toInt())
+        blRight.setTextColor(if (sigRightBlink[i] > 0.5) 0xFFFFD60A.toInt() else 0xFF555555.toInt())
+    }
+
+    /** 找最接近时刻 t 的采样索引（二分） */
+    private fun nearestIndex(t: Double): Int {
+        val a = sigT
+        if (a.isEmpty()) return -1
+        var lo = 0; var hi = a.size - 1
+        while (lo < hi) {
+            val mid = (lo + hi) / 2
+            if (a[mid] < t) lo = mid + 1 else hi = mid
+        }
+        // lo 是第一个 >= t；与 lo-1 比较取更近的
+        return if (lo > 0 && Math.abs(a[lo - 1] - t) <= Math.abs(a[lo] - t)) lo - 1 else lo
+    }
+
+    // =====================================================================
+    //  解析 op_parser 的 JSON（signals 数组）为原生 double[]
+    // =====================================================================
+
+    private fun parseSignals(json: String) {
+        fun arr(key: String): DoubleArray {
+            val m = Regex("\"" + key + "\"\\s*:\\s*\\[([^\\]]*)\\]").find(json) ?: return DoubleArray(0)
+            val body = m.groupValues[1].trim()
+            if (body.isEmpty()) return DoubleArray(0)
+            return body.split(",").mapNotNull { it.trim().toDoubleOrNull() }.toDoubleArray()
+        }
+        sigT = arr("t")
+        sigVEgo = arr("vEgo")
+        sigGas = arr("gas")
+        sigBrake = arr("brake")
+        sigSteer = arr("steer")
+        sigLeftBlink = arr("leftBlinker")
+        sigRightBlink = arr("rightBlinker")
+        sigGasPressed = arr("gasPressed")
+        sigBrakePressed = arr("brakePressed")
     }
 
     private fun stopSync() {
@@ -539,13 +626,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Make [src] playable by a WebView <video>.
+     * Make [src] playable by the native VideoView.
      *
      *  - If the file already has an ISO-BMFF (mp4) header we keep it as-is.
      *  - Otherwise (openpilot HEVC raw Annex-B: fcamera.hevc / ecamera.hevc) we do a REAL
-     *    hardware transcode: HEVC decoder -> H.264 encoder -> mp4. This is what makes the
-     *    video play inside the WebView while the signal charts / blinkers / wheel stay visible
-     *    underneath (that's the whole point of this app).
+     *    hardware transcode: HEVC decoder -> H.264 encoder -> mp4. H.264 mp4 plays in the
+     *    native VideoView via the platform hardware decoder, with the native signal panel
+     *    (charts / blinkers / wheel) drawn underneath (that's the whole point of this app).
      *
      *  Falls back to returning [src] if anything goes wrong.
      */
@@ -577,16 +664,6 @@ class MainActivity : AppCompatActivity() {
             b.copyOf(n).joinToString(" ") { "%02x".format(it) }
         }
     } catch (e: Exception) { "ERR:${e.message}" }
-
-    private fun buildHtml(signalsJson: String, videoFile: File, wideFile: File? = null): String {
-        val chartJs = assets.open("chart.umd.min.js").bufferedReader().readText()
-        val tpl = assets.open("replay_template.html").bufferedReader().readText()
-        val wideName = wideFile?.name ?: "__CAM_E__"
-        return tpl.replace("__CHARTJS__", chartJs)
-            .replace("__SERIES_JSON__", signalsJson)
-            .replace("__CAM_E__", wideName)
-            .replace("__VIDEO_FILE__", videoFile.name)
-    }
 
     private fun displayName(uri: Uri): String {
         var name = "unknown"

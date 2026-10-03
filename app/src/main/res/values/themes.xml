@@ -5,4 +5,29 @@
         <item name="android:statusBarColor">#000000</item>
         <item name="android:windowBackground">#000000</item>
     </style>
+
+    <!-- 信号数值卡片 -->
+    <style name="Card">
+        <item name="android:layout_width">0dp</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:layout_weight">1</item>
+        <item name="android:orientation">vertical</item>
+        <item name="android:gravity">center</item>
+        <item name="android:background">#1c1c1e</item>
+        <item name="android:padding">8dp</item>
+        <item name="android:layout_margin">2dp</item>
+    </style>
+    <style name="CardK">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">#8e8e93</item>
+    </style>
+    <style name="CardV">
+        <item name="android:layout_width">wrap_content</item>
+        <item name="android:layout_height">wrap_content</item>
+        <item name="android:textSize">22sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:text">--</item>
+    </style>
 </resources>

@@ -192,6 +192,9 @@ public class HevcTranscoder {
         android.media.Image.Plane[] dp = dst.getPlanes();
         int planes = Math.min(sp.length, dp.length);
         for (int p = 0; p < planes; p++) {
+            // decoder plane buffers are usually READ-ONLY; duplicate() so we can
+            // still use absolute get() without tripping the read-only guard, and
+            // get a writable duplicate for the destination.
             ByteBuffer sb = sp[p].getBuffer();
             ByteBuffer db = dp[p].getBuffer();
             int sRowStride = sp[p].getRowStride();
@@ -201,28 +204,26 @@ public class HevcTranscoder {
             int w = src.getWidth() >> (p == 0 ? 0 : 1);
             int h = src.getHeight() >> (p == 0 ? 0 : 1);
 
-            sb.rewind();
-            db.rewind();
             if (sPixStride == 1 && dPixStride == 1) {
-                // simple row-by-row copy
                 int rowBytes = Math.min(sRowStride, dRowStride);
                 byte[] line = new byte[rowBytes];
                 for (int row = 0; row < h; row++) {
                     int sPos = row * sRowStride;
                     int dPos = row * dRowStride;
-                    if (sPos + rowBytes > sb.capacity() || dPos + rowBytes > db.capacity()) break;
-                    sb.position(sPos); sb.get(line, 0, rowBytes);
-                    db.position(dPos); db.put(line, 0, rowBytes);
+                    if (sPos + rowBytes > sb.limit() || dPos + rowBytes > db.limit()) break;
+                    sb.position(sPos);
+                    sb.get(line, 0, rowBytes);
+                    db.position(dPos);
+                    db.put(line, 0, rowBytes);
                 }
             } else {
-                // pixel-by-pixel (slower, but correct for interleaved/odd strides)
-                int copyW = Math.min(w, Math.min(sb.capacity() / Math.max(1, sPixStride),
-                        db.capacity() / Math.max(1, dPixStride)));
+                int copyW = Math.min(w, Math.min(sb.limit() / Math.max(1, sPixStride),
+                        db.limit() / Math.max(1, dPixStride)));
                 for (int row = 0; row < h; row++) {
                     for (int col = 0; col < copyW; col++) {
                         int sPos = row * sRowStride + col * sPixStride;
                         int dPos = row * dRowStride + col * dPixStride;
-                        if (sPos >= sb.capacity() || dPos >= db.capacity()) continue;
+                        if (sPos >= sb.limit() || dPos >= db.limit()) continue;
                         db.put(dPos, sb.get(sPos));
                     }
                 }

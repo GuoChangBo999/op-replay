@@ -143,11 +143,111 @@
             android:layout_weight="1"
             android:text="广角" />
     </LinearLayout>
-    <!-- signal overlay / charts -->
-    <WebView
-        android:id="@+id/web"
+    <!-- ===================== 原生信号面板（不再用 WebView） ===================== -->
+    <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_weight="1"
+        android:background="#000000"
+        android:layout_marginTop="4dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <!-- 转向灯 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:paddingTop="4dp">
+                <TextView
+                    android:id="@+id/blLeft"
+                    android:layout_width="0dp"
+                    android:layout_height="64dp"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:text="◀ 左转"
+                    android:textSize="20sp"
+                    android:textColor="#555555"
+                    android:background="#141414" />
+                <View android:layout_width="8dp" android:layout_height="1dp" />
+                <TextView
+                    android:id="@+id/blRight"
+                    android:layout_width="0dp"
+                    android:layout_height="64dp"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:text="右转 ▶"
+                    android:textSize="20sp"
+                    android:textColor="#555555"
+                    android:background="#141414" />
+            </LinearLayout>
+
+            <!-- 数值卡片 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:paddingTop="6dp">
+                <LinearLayout style="@style/Card">
+                    <TextView style="@style/CardK" android:text="车速 km/h" />
+                    <TextView android:id="@+id/cSpd" style="@style/CardV" android:textColor="#3b9eff" />
+                </LinearLayout>
+                <LinearLayout style="@style/Card">
+                    <TextView style="@style/CardK" android:text="油门 %" />
+                    <TextView android:id="@+id/cGas" style="@style/CardV" android:textColor="#00e676" />
+                </LinearLayout>
+                <LinearLayout style="@style/Card">
+                    <TextView style="@style/CardK" android:text="刹车 %" />
+                    <TextView android:id="@+id/cBrk" style="@style/CardV" android:textColor="#ff5252" />
+                </LinearLayout>
+                <LinearLayout style="@style/Card">
+                    <TextView style="@style/CardK" android:text="方向 °" />
+                    <TextView android:id="@+id/cStr" style="@style/CardV" android:textColor="#ffd60a" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 方向盘（自定义 View） + 角度文字 -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingTop="6dp">
+                <ai.openpilot.replay.WheelView
+                    android:id="@+id/wheel"
+                    android:layout_width="150dp"
+                    android:layout_height="150dp" />
+                <TextView
+                    android:id="@+id/cWheel"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:gravity="center"
+                    android:textSize="26sp"
+                    android:textStyle="bold"
+                    android:textColor="#ffd60a"
+                    android:text="0°" />
+            </LinearLayout>
+
+            <!-- 曲线图（自定义 View），点它可跳转视频 -->
+            <ai.openpilot.replay.ChartView
+                android:id="@+id/chart"
+                android:layout_width="match_parent"
+                android:layout_height="200dp"
+                android:layout_marginTop="6dp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:text="点曲线可跳转视频"
+                android:textSize="12sp"
+                android:textColor="#666666"
+                android:paddingTop="4dp" />
+        </LinearLayout>
+    </ScrollView>
 
 </LinearLayout>
