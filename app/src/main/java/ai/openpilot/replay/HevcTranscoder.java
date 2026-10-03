@@ -79,6 +79,7 @@ public final class HevcTranscoder {
 
             // ---- 2. split into csd (VPS+SPS+PPS) + one sample per PICTURE ----
             ByteArrayOutputStream csdW = new ByteArrayOutputStream();
+            byte[] vpsRaw = null, spsRaw = null, ppsRaw = null;
             int w = 0, h = 0;
             List<List<long[]>> samples = new ArrayList<>();
             List<long[]> curSlices = new ArrayList<>();
@@ -100,10 +101,15 @@ public final class HevcTranscoder {
                     in.seek(nalDataOff);
                     in.readFully(nal);
                     writeLengthPrefixed(csdW, nal);
-                    if (nalType == 33 && w == 0) {
-                        int[] wh = parseSpsSize(nal);
-                        if (wh != null) { w = wh[0]; h = wh[1]; }
+                    if (nalType == 32) vpsRaw = nal;
+                    if (nalType == 33) {
+                        spsRaw = nal;
+                        if (w == 0) {
+                            int[] wh = parseSpsSize(nal);
+                            if (wh != null) { w = wh[0]; h = wh[1]; }
+                        }
                     }
+                    if (nalType == 34) ppsRaw = nal;
                 } else if (nalType < 32) {
                     boolean firstSlice;
                     if (nalLen >= 3) {
@@ -136,13 +142,18 @@ public final class HevcTranscoder {
             MediaFormat fmt = MediaFormat.createVideoFormat("video/hevc", w, h);
             fmt.setInteger(MediaFormat.KEY_FRAME_RATE, DEFAULT_FPS);
             fmt.setInteger("max-input-size", 4 * 1024 * 1024);
-            // IMPORTANT: csd-0 must be a DIRECT ByteBuffer. With a heap (wrap) buffer,
-            // some Qualcomm/Android MediaMuxer builds fail to build the 'stsd' box and
-            // then silently DROP every writeSampleData() -> an empty 585-byte mp4 whose
-            // 'stbl' is empty. That was the black-screen root cause.
-            byte[] csd = csdW.toByteArray();
-            ByteBuffer csdBuf = ByteBuffer.allocateDirect(csd.length);
-            csdBuf.put(csd);
+            // csd-0 for video/hevc MUST be a HEVCDecoderConfigurationRecord ('hvcC'),
+            // NOT raw length-prefixed VPS/SPS/PPS. With raw NALs, MediaMuxer fails to
+            // build the 'hev1' sample entry and then SILENTLY DROPS every sample ->
+            // empty 585-byte file (the black-screen root cause we reproduced).
+            if (vpsRaw == null || spsRaw == null || ppsRaw == null) {
+                log("missing VPS/SPS/PPS: vps=" + (vpsRaw!=null) + " sps=" + (spsRaw!=null) + " pps=" + (ppsRaw!=null));
+                throw new IOException("missing parameter sets");
+            }
+            byte[] hvcc = buildHvcC(vpsRaw, spsRaw, ppsRaw);
+            log("hvcC bytes=" + hvcc.length + " (vps=" + vpsRaw.length + " sps=" + spsRaw.length + " pps=" + ppsRaw.length + ")");
+            ByteBuffer csdBuf = ByteBuffer.allocateDirect(hvcc.length);
+            csdBuf.put(hvcc);
             csdBuf.flip();
             fmt.setByteBuffer("csd-0", csdBuf);
 
@@ -237,6 +248,60 @@ public final class HevcTranscoder {
         int n = nal.length;
         o.write((n >>> 24) & 0xFF); o.write((n >>> 16) & 0xFF);
         o.write((n >>> 8) & 0xFF);  o.write(n & 0xFF);
+        o.write(nal, 0, nal.length);
+    }
+
+    /**
+     * Build a HEVCDecoderConfigurationRecord ('hvcC') from VPS/SPS/PPS.
+     * This is what Android's MediaMuxer expects in csd-0 for "video/hevc";
+     * giving it raw NALs makes it drop every sample silently.
+     */
+    private static byte[] buildHvcC(byte[] vps, byte[] sps, byte[] pps) {
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        o.write(1);                                  // configurationVersion
+        // general_profile_space(2)|general_tier_flag(1)|general_profile_idc(5)
+        int profileIdc = (sps.length > 1) ? (sps[1] & 0x1F) : 1;
+        o.write(profileIdc);
+        // general_profile_compatibility_flags (u32)
+        o.write(0); o.write(0); o.write(0); o.write(0x60);
+        // general_constraint_indicator_flags (48 bits)
+        o.write(0); o.write(0); o.write(0); o.write(0); o.write(0); o.write(0);
+        // general_level_idc (from SPS if available, else 0x5A = level 90)
+        int levelIdc = 0x5A;
+        try {
+            byte[] rbsp = removeEmulationPrevention(sps, 0, sps.length);
+            // find general_level_idc: it's byte index 12 of profile_tier_level after NAL header
+            // (2 header + 1 vps_id/temporal + 2+1+5+32 ... ) -> use heuristic: SPS[12] holds level
+            if (rbsp.length > 12) levelIdc = rbsp[12] & 0xFF;
+        } catch (Throwable ignored) {}
+        o.write(levelIdc);
+        // min_spatial_segmentation_idc (4 bits reserved 1111)
+        o.write(0xF0); o.write(0x00);
+        // parallelismType (reserved 111111 + 2 bits)
+        o.write(0xFC);
+        // chromaFormat (reserved 111111 + 2 bits) -> 1 = 4:2:0
+        o.write(0xFC | 1);
+        // bitDepthLumaMinus8 (reserved 11111 + 3 bits) -> 0
+        o.write(0xF8);
+        // bitDepthChromaMinus8
+        o.write(0xF8);
+        // avgFrameRate (u16) = 0
+        o.write(0); o.write(0);
+        // constantFrameRate(2)|numTemporalLayers(3)|temporalIdNested(1)|lengthSizeMinusOne(2)
+        // lengthSizeMinusOne = 3 (4-byte NAL length prefixes, matching our samples)
+        o.write(0x0F);
+        // numOfArrays
+        o.write(3);
+        writeArray(o, 32, vps);
+        writeArray(o, 33, sps);
+        writeArray(o, 34, pps);
+        return o.toByteArray();
+    }
+
+    private static void writeArray(ByteArrayOutputStream o, int nalType, byte[] nal) {
+        o.write(0x80 | (nalType & 0x3F));            // array_completeness=1 | nal_unit_type
+        o.write((nal.length >> 8) & 0xFF);
+        o.write(nal.length & 0xFF);
         o.write(nal, 0, nal.length);
     }
 
